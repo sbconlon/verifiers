@@ -1,0 +1,21 @@
+[project]
+name = "alfworld-env"
+description = "ALFWorld household task environment for verifiers / prime-rl"
+tags = ["alfworld", "multi-turn", "embodied", "textworld", "train", "eval"]
+version = "0.1.0"
+dependencies = [
+    "verifiers>=0.1.10.dev4",
+    "alfworld",
+    "datasets",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["alfworld_env.py"]
+
+[tool.verifiers.eval]
+num_examples = 5
+rollouts_per_example = 4
