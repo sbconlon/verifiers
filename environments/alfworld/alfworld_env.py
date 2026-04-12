@@ -7,12 +7,15 @@ Environment contract:
   - reward:          1.0 if state["won"] else 0.0 (set by env_response on terminal step)
 """
 import asyncio
+import logging
 import os
 import re
 import threading
 
 import verifiers as vf
 from datasets import Dataset
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,6 +39,20 @@ SYSTEM_PROMPT = (
 # cache miss (i.e. first time a given game file is seen in this process).
 _TW_ENV_ID_CACHE: dict[str, str] = {}
 _TW_REGISTER_LOCK = threading.Lock()
+_TW_PARSE_LOCK = threading.Lock()
+
+
+def _make_demangler(env):
+    """Factory: fresh AlfredDemangler(shuffle=False) per gym.make() call.
+
+    AlfredDemangler must NOT be passed as a shared instance to register_games()
+    because textworld._make_env() calls wrapper(env) which mutates _wrapped_env
+    on the same object — causing rollouts to corrupt each other's wrapper chain.
+    """
+    from alfworld.agents.environment.alfred_tw_env import AlfredDemangler
+    d = AlfredDemangler(shuffle=False)
+    d._wrapped_env = env
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -61,24 +78,30 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 import textworld.gym
                 from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInfos
 
-                request_infos = textworld.EnvInfos(won=True, admissible_commands=True)
+                request_infos = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
                 tw_env_id = textworld.gym.register_games(
                     [game_file],
                     request_infos,
                     batch_size=1,
                     asynchronous=False,
                     max_episode_steps=MAX_EPISODE_STEPS,
-                    wrappers=[AlfredDemangler(shuffle=False), AlfredInfos],
+                    wrappers=[_make_demangler, AlfredInfos],  # _make_demangler = fresh instance per gym.make() call
                 )
                 _TW_ENV_ID_CACHE[game_file] = tw_env_id
 
         return _TW_ENV_ID_CACHE[game_file]
 
     def _make_tw_env(self, game_file: str):
-        """Instantiate and return a fresh TextWorld gym env for one game file."""
+        """Instantiate and return a fresh TextWorld gym env for one game file.
+
+        gym.make() constructs the wrapper chain and may touch the tatsu textgen
+        parser during init. Serialise with _TW_PARSE_LOCK to avoid concurrent
+        threads corrupting the module-level _PARSER state.
+        """
         import textworld.gym
         tw_env_id = self._get_tw_env_id(game_file)
-        return textworld.gym.make(tw_env_id)
+        with _TW_PARSE_LOCK:
+            return textworld.gym.make(tw_env_id)
 
     @staticmethod
     def _format_obs(obs: str, admissible_commands: list[str]) -> str:
@@ -88,8 +111,25 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
     async def setup_state(self, state: vf.State) -> vf.State:
         game_file = state["info"]["game_file"]
+        logger.debug(f"setup_state: loading {game_file}")
         tw_env = await asyncio.to_thread(self._make_tw_env, game_file)
-        obs, infos = await asyncio.to_thread(tw_env.reset)
+
+        def _reset():
+            with _TW_PARSE_LOCK:
+                return tw_env.reset()
+
+        try:
+            obs, infos = await asyncio.to_thread(_reset)
+        except Exception as exc:
+            # TextWorld 1.7.0 textgen parser fails on some game file templates.
+            # Re-raise as vf.Error so the framework catches it, records the
+            # episode as failed (reward 0.0), and keeps the worker alive.
+            logger.warning(f"setup_state: reset() failed for {game_file!r}: {exc}")
+            try:
+                tw_env.close()
+            except Exception:
+                pass
+            raise vf.Error(f"setup_state failed for {game_file!r}: {exc}") from exc
 
         state["alf_env"] = tw_env
         state["won"] = False
@@ -137,7 +177,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tw_env = state["alf_env"]
         action = self._parse_action(messages)
 
-        obs, _reward, done, infos = await asyncio.to_thread(tw_env.step, [action])
+        def _step():
+            with _TW_PARSE_LOCK:
+                return tw_env.step([action])
+
+        obs, _reward, done, infos = await asyncio.to_thread(_step)
 
         content = self._format_obs(obs[0], infos["admissible_commands"][0])
         response = vf.UserMessage(content=content)
@@ -209,6 +253,6 @@ def load_environment(
         dataset=lambda: build_dataset(data_path, split),
         rubric=rubric,
         max_turns=max_turns,
-        env_id="alfworld",
+        env_id="alfworld-env",
     )
     return env
