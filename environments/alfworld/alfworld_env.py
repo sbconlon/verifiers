@@ -5,6 +5,20 @@ Environment contract:
   - env_response():  parse <action> from last AssistantMessage, step game, return UserMessage
   - cleanup:         remove non-serializable tw_env from state before ZMQ serialization
   - reward:          1.0 if state["won"] else 0.0 (set by env_response on terminal step)
+
+Context window truncation (optional, enabled when max_context_tokens > 0):
+  - get_prompt_messages() enforces the token budget before each LLM call.
+  - Eviction policy: FIFO from messages[1:] — messages[0] (system prompt) is always kept.
+    The initial task observation (messages[1]) is evictable: losing it creates strong partial
+    observability and maximally satisfies the strategic relevance test (two trajectories with
+    identical recent context but different evicted tasks have widely divergent optimal actions).
+  - Token counting: one POST to vLLM /tokenize per turn on the full message list.
+    Exact counts, no local tokenizer needed. If the count exceeds the budget, messages are
+    popped one at a time from messages[1:] and re-counted until the budget is satisfied.
+  - Truncation metrics written to state for §5 reporting:
+      state["context_truncated"]          bool  — whether any eviction occurred this episode
+      state["context_truncated_at_turn"]  int   — trajectory step index of first eviction
+      state["context_evictions"]          int   — total messages evicted across the episode
 """
 import asyncio
 import logging
@@ -12,6 +26,7 @@ import os
 import re
 import threading
 
+import httpx
 import verifiers as vf
 from datasets import Dataset
 
@@ -61,6 +76,18 @@ def _make_demangler(env):
 
 class ALFWorldEnvironment(vf.MultiTurnEnv):
 
+    def __init__(self, max_context_tokens: int = -1, **kwargs):
+        super().__init__(**kwargs)
+        self.max_context_tokens = max_context_tokens
+        # Shared httpx client across rollouts in this env worker process.
+        # Initialised lazily in _get_http_client() to avoid creating it at
+        # import time (before the asyncio event loop exists).
+        self._http_client: httpx.AsyncClient | None = None
+
+    # ------------------------------------------------------------------
+    # TextWorld helpers
+    # ------------------------------------------------------------------
+
     def _get_tw_env_id(self, game_file: str) -> str:
         """Return the textworld gym id for game_file, registering it if needed.
 
@@ -85,7 +112,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                     batch_size=1,
                     asynchronous=False,
                     max_episode_steps=MAX_EPISODE_STEPS,
-                    wrappers=[_make_demangler, AlfredInfos],  # _make_demangler = fresh instance per gym.make() call
+                    wrappers=[_make_demangler, AlfredInfos],
                 )
                 _TW_ENV_ID_CACHE[game_file] = tw_env_id
 
@@ -108,6 +135,143 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """Combine observation text with the list of available actions."""
         commands = "\n".join(admissible_commands)
         return f"{obs}\n\nAvailable actions:\n{commands}"
+
+    # ------------------------------------------------------------------
+    # Context window truncation
+    # ------------------------------------------------------------------
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Return a reusable async HTTP client for /tokenize calls."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=10.0)
+        return self._http_client
+
+    @staticmethod
+    def _derive_tokenize_url(state: vf.State) -> str:
+        """Derive the vLLM /tokenize URL from the inference client's base_url.
+
+        The client's base_url is the OpenAI-compatible root, e.g.
+        "http://localhost:8765/v1/". The /tokenize endpoint lives at the
+        server root (not under /v1), so we strip the /v1 suffix.
+        """
+        base = str(state["client"].client.base_url).rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        return base.rstrip("/") + "/tokenize"
+
+    async def _count_tokens(self, messages: vf.Messages, state: vf.State) -> int:
+        """Return the exact token count for messages via vLLM /tokenize.
+
+        Sends the full message list with the chat template applied server-side.
+        add_generation_prompt=True matches what vLLM does before inference.
+        The URL is derived once per rollout and cached in state["_tokenize_url"].
+        """
+        if "_tokenize_url" not in state:
+            state["_tokenize_url"] = self._derive_tokenize_url(state)
+
+        # Serialise messages to plain role/content dicts.
+        # The /tokenize endpoint applies the chat template server-side, so we
+        # only need role and content — no extra fields.
+        payload_messages = []
+        for msg in messages:
+            d = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
+            role = d.get("role", "user")
+            content = d.get("content") or ""
+            # Flatten list content parts to a single string (ALFWorld is text-only).
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            payload_messages.append({"role": role, "content": content})
+
+        http = await self._get_http_client()
+        response = await http.post(
+            state["_tokenize_url"],
+            json={
+                "model": state["model"],
+                "messages": payload_messages,
+                "add_generation_prompt": True,
+            },
+        )
+        response.raise_for_status()
+        return response.json()["count"]
+
+    async def _apply_sliding_window(
+        self, messages: vf.Messages, state: vf.State
+    ) -> vf.Messages:
+        """Evict oldest messages until the token count fits within budget.
+
+        messages[0] (system prompt) is always preserved.
+        messages[1:] are eviction candidates, removed FIFO (oldest first).
+
+        After each eviction the token count is re-queried exactly via /tokenize.
+        In practice ALFWorld episodes evict at most 1-2 messages per turn, so
+        the loop runs at most 2-3 iterations.
+
+        Truncation metrics are recorded in state on first eviction:
+          state["context_truncated"]          bool
+          state["context_truncated_at_turn"]  int   (trajectory step index)
+          state["context_evictions"]          int   (cumulative across episode)
+        """
+        count = await self._count_tokens(messages, state)
+        if count <= self.max_context_tokens:
+            return messages
+
+        messages = list(messages)  # mutable copy; messages[0] is system prompt
+
+        while count > self.max_context_tokens:
+            if len(messages) <= 1:
+                # Only the system prompt remains — cannot evict further.
+                logger.warning(
+                    f"Context budget ({self.max_context_tokens} tokens) is smaller "
+                    f"than the system prompt alone ({count} tokens). "
+                    f"Returning system prompt only."
+                )
+                break
+
+            evicted = messages.pop(1)
+            evicted_role = getattr(evicted, "role", "?")
+            evicted_chars = len(str(getattr(evicted, "content", "") or ""))
+            logger.debug(
+                f"Evicted {evicted_role} message (~{evicted_chars} chars) "
+                f"at turn {len(state['trajectory'])}. "
+                f"Remaining messages: {len(messages)}."
+            )
+
+            # Record truncation metrics on first eviction in this episode.
+            if not state.get("context_truncated"):
+                state["context_truncated"] = True
+                state["context_truncated_at_turn"] = len(state["trajectory"])
+                state["context_evictions"] = 0
+            state["context_evictions"] += 1
+
+            count = await self._count_tokens(messages, state)
+
+        return messages
+
+    async def get_prompt_messages(self, state: vf.State) -> vf.Messages:
+        """Build the prompt for the next LLM call, applying context truncation if configured.
+
+        Calls the parent implementation first (which appends the latest env response),
+        then enforces max_context_tokens via _apply_sliding_window if set.
+        Truncation errors are caught and logged — on failure the untruncated messages
+        are returned so the rollout can continue (vLLM will reject if truly too long).
+        """
+        messages = await super().get_prompt_messages(state)
+        if self.max_context_tokens <= 0:
+            return messages
+        try:
+            return await self._apply_sliding_window(messages, state)
+        except Exception as exc:
+            logger.warning(
+                f"Token counting failed ({exc}); skipping truncation this turn. "
+                f"vLLM will reject if prompt exceeds its context limit."
+            )
+            return messages
+
+    # ------------------------------------------------------------------
+    # Environment lifecycle
+    # ------------------------------------------------------------------
 
     async def setup_state(self, state: vf.State) -> vf.State:
         game_file = state["info"]["game_file"]
@@ -133,6 +297,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
         state["alf_env"] = tw_env
         state["won"] = False
+        # Truncation metrics — initialised here so they are always present in
+        # state even for episodes where truncation never fires.
+        state["context_truncated"] = False
+        state["context_truncated_at_turn"] = None
+        state["context_evictions"] = 0
         initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
         state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
         return state
@@ -243,16 +412,16 @@ def load_environment(
     data_path: str = os.path.expanduser("~/.cache/alfworld/json_2.1.1"),
     split: str = "train",
     max_turns: int = MAX_EPISODE_STEPS,
+    max_context_tokens: int = -1,
 ) -> vf.Environment:
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward)
 
     env = ALFWorldEnvironment(
-        # Callable so the dataset is built lazily — after env_id is set by
-        # vf.load_environment(), ensuring the task column matches resolved_name.
         dataset=lambda: build_dataset(data_path, split),
         rubric=rubric,
         max_turns=max_turns,
+        max_context_tokens=max_context_tokens,
         env_id="alfworld-env",
     )
     return env
