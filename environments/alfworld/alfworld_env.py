@@ -154,7 +154,13 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         "http://localhost:8765/v1/". The /tokenize endpoint lives at the
         server root (not under /v1), so we strip the /v1 suffix.
         """
-        base = str(state["client"].client.base_url).rstrip("/")
+        client = state["client"]
+        if hasattr(client, "client"):
+            # Live Client wrapper (orchestrator process)
+            base = str(client.client.base_url).rstrip("/")
+        else:
+            # ClientConfig (subprocess worker reconstruction)
+            base = str(client.api_base_url).rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3]
         return base.rstrip("/") + "/tokenize"
@@ -264,7 +270,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             return await self._apply_sliding_window(messages, state)
         except Exception as exc:
             logger.warning(
-                f"Token counting failed ({exc}); skipping truncation this turn. "
+                f"Token counting failed ({type(exc).__name__}: {exc!r}); skipping truncation this turn. "
                 f"vLLM will reject if prompt exceeds its context limit."
             )
             return messages
@@ -367,7 +373,9 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 # ---------------------------------------------------------------------------
 
 def alfworld_reward(state: vf.State, **kwargs) -> float:
-    state.setdefault("metrics", {}).update({
+    if not isinstance(state.get("metrics"), dict):
+        state["metrics"] = {}
+    state["metrics"].update({
         "context_truncated": float(state.get("context_truncated", False)),
         "context_evictions": float(state.get("context_evictions", 0)),
     })
