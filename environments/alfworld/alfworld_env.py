@@ -367,6 +367,10 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 # ---------------------------------------------------------------------------
 
 def alfworld_reward(state: vf.State, **kwargs) -> float:
+    state.setdefault("metrics", {}).update({
+        "context_truncated": float(state.get("context_truncated", False)),
+        "context_evictions": float(state.get("context_evictions", 0)),
+    })
     return 1.0 if state.get("won", False) else 0.0
 
 
