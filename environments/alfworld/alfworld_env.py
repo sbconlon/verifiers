@@ -21,10 +21,12 @@ Context window truncation (optional, enabled when max_context_tokens > 0):
       state["context_evictions"]          int   — total messages evicted across the episode
 """
 import asyncio
+import datetime
 import logging
 import os
 import re
 import threading
+from pathlib import Path
 
 import httpx
 import verifiers as vf
@@ -39,14 +41,16 @@ logger = logging.getLogger(__name__)
 MAX_EPISODE_STEPS = 50
 
 SYSTEM_PROMPT = (
-    "You are an agent solving household tasks in a text-based environment.\n\n"
-    "At each step you receive an observation describing your current location and "
-    "the objects visible to you. Your task is stated in the first observation.\n\n"
-    "Think through your plan step by step, then output your action using exactly "
-    "this format:\n"
-    "<think>\nyour reasoning\n</think>\n"
-    "<action>\nyour action\n</action>\n\n"
-    "Choose exactly one action from the Available actions list at the end of each observation."
+    "You are an expert agent solving household tasks in a text-based environment. "
+    "At each step you receive an observation describing your surroundings and a list "
+    "of admissible actions. Your goal is stated in the first observation."
+)
+
+FORMAT_REMINDER = (
+    "\n\nNow it's your turn to take an action. "
+    "You MUST enclose your reasoning within <think> </think> tags, "
+    "then choose one action from the list above and enclose it within "
+    "<action> </action> tags."
 )
 
 # Per-process cache: game_file -> tw_env_id registered with textworld.gym.
@@ -76,9 +80,10 @@ def _make_demangler(env):
 
 class ALFWorldEnvironment(vf.MultiTurnEnv):
 
-    def __init__(self, max_context_tokens: int = -1, **kwargs):
+    def __init__(self, max_context_tokens: int = -1, log_trajectories: str = "none", **kwargs):
         super().__init__(**kwargs)
         self.max_context_tokens = max_context_tokens
+        self.log_trajectories = log_trajectories  # "none" | "wins" | "all"
         # Shared httpx client across rollouts in this env worker process.
         # Initialised lazily in _get_http_client() to avoid creating it at
         # import time (before the asyncio event loop exists).
@@ -132,9 +137,13 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
     @staticmethod
     def _format_obs(obs: str, admissible_commands: list[str]) -> str:
-        """Combine observation text with the list of available actions."""
+        """Combine observation text with the list of available actions and format reminder."""
         commands = "\n".join(admissible_commands)
-        return f"{obs}\n\nAvailable actions:\n{commands}"
+        return (
+            f"{obs}\n\n"
+            f"Your admissible actions for this step are:\n{commands}"
+            f"{FORMAT_REMINDER}"
+        )
 
     # ------------------------------------------------------------------
     # Context window truncation
@@ -238,6 +247,16 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             evicted = messages.pop(1)
             evicted_role = getattr(evicted, "role", "?")
             evicted_chars = len(str(getattr(evicted, "content", "") or ""))
+            # Evict the paired assistant response together with its user prompt
+            # so the context never contains an orphaned reply without its question.
+            if (
+                evicted_role == "user"
+                and len(messages) > 1
+                and getattr(messages[1], "role", None) == "assistant"
+            ):
+                paired = messages.pop(1)
+                evicted_chars += len(str(getattr(paired, "content", "") or ""))
+                state["context_evictions"] = state.get("context_evictions", 0) + 1
             logger.debug(
                 f"Evicted {evicted_role} message (~{evicted_chars} chars) "
                 f"at turn {len(state['trajectory'])}. "
@@ -264,16 +283,15 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         are returned so the rollout can continue (vLLM will reject if truly too long).
         """
         messages = await super().get_prompt_messages(state)
-        if self.max_context_tokens <= 0:
-            return messages
-        try:
-            return await self._apply_sliding_window(messages, state)
-        except Exception as exc:
-            logger.warning(
-                f"Token counting failed ({type(exc).__name__}: {exc!r}); skipping truncation this turn. "
-                f"vLLM will reject if prompt exceeds its context limit."
-            )
-            return messages
+        if self.max_context_tokens > 0:
+            try:
+                messages = await self._apply_sliding_window(messages, state)
+            except Exception as exc:
+                logger.warning(
+                    f"Token counting failed ({type(exc).__name__}: {exc!r}); skipping truncation this turn. "
+                    f"vLLM will reject if prompt exceeds its context limit."
+                )
+        return messages
 
     # ------------------------------------------------------------------
     # Environment lifecycle
@@ -347,6 +365,88 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
                 return text if text else content.strip()
         return "look"  # safe no-op if no model message found
+
+    @staticmethod
+    def _label_prompt(messages, step_idx: int) -> list[str]:
+        """Assign global turn labels to the post-eviction messages for trajectory step step_idx.
+
+        Labels are derived by counting backwards from the end of the message list.
+        At step k (0-indexed), the last user message is User (Turn k) and the last
+        assistant message is Assistant (Turn k).
+        """
+        user_count = step_idx + 1  # last user msg = User (Turn step_idx+1)
+        asst_count = step_idx      # last asst msg = Assistant (Turn step_idx)
+        labels = []
+        for msg in reversed(messages):
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "user")
+            if role == "system":
+                labels.append("System Prompt")
+            elif role == "user":
+                labels.append(f"User (Turn {user_count})")
+                user_count -= 1
+            elif role == "assistant":
+                labels.append(f"Assistant (Turn {asst_count})")
+                asst_count -= 1
+        labels.reverse()
+        return labels
+
+    @staticmethod
+    def _write_trajectory_log(state: vf.State) -> None:
+        """Write a human-readable trajectory log annotating each assistant turn with its context window."""
+        game_file = state.get("info", {}).get("game_file", "unknown")
+        task_name = Path(game_file).parent.name
+        outcome = "win" if state.get("won") else "loss"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        log_dir = Path.cwd() / "trajectories"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / f"{task_name}_{outcome}_{timestamp}.txt"
+
+        def _content(msg) -> str:
+            c = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            return str(c or "")
+
+        lines: list[str] = []
+
+        # Initial prompt: system message + initial observation
+        for msg in state.get("prompt", []):
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "user")
+            if role == "system":
+                lines += ["==== System Prompt", _content(msg), ""]
+            elif role == "user":
+                lines += ["==== User (Turn 1)", _content(msg), ""]
+
+        # One TrajectoryStep per LLM call
+        trajectory = state.get("trajectory", [])
+        for k, step in enumerate(trajectory):
+            ctx_labels = ALFWorldEnvironment._label_prompt(step["prompt"], k)
+            asst_content = _content(step["completion"][0]) if step["completion"] else ""
+            lines += [
+                f"==== Assistant (Turn {k + 1})",
+                f"Context = [{', '.join(ctx_labels)}]",
+                asst_content,
+                "",
+            ]
+            # Env response: last message of the next step's prompt, or the terminal response,
+            # or absent if the episode ended by hitting max_turns without a game response.
+            if k + 1 < len(trajectory):
+                env_content = _content(trajectory[k + 1]["prompt"][-1])
+                lines += [f"==== User (Turn {k + 2})", env_content, ""]
+            else:
+                final_env_response = state.get("final_env_response")
+                if final_env_response:
+                    lines += [f"==== User (Turn {k + 2})", _content(final_env_response[0]), ""]
+
+        log_path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info(f"Trajectory log written: {log_path}")
+
+    async def render_completion(self, state: vf.State) -> None:
+        await super().render_completion(state)
+        if self.log_trajectories == "none":
+            return
+        won = state.get("won", False)
+        should_log = self.log_trajectories == "all" or (self.log_trajectories == "wins" and won)
+        if should_log:
+            self._write_trajectory_log(state)
 
     async def env_response(self, messages: vf.Messages, state: vf.State) -> vf.Messages:
         tw_env = state["alf_env"]
@@ -425,6 +525,7 @@ def load_environment(
     split: str = "train",
     max_turns: int = MAX_EPISODE_STEPS,
     max_context_tokens: int = -1,
+    log_trajectories: str = "none",
 ) -> vf.Environment:
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward)
@@ -434,6 +535,7 @@ def load_environment(
         rubric=rubric,
         max_turns=max_turns,
         max_context_tokens=max_context_tokens,
+        log_trajectories=log_trajectories,
         env_id="alfworld-env",
     )
     return env
