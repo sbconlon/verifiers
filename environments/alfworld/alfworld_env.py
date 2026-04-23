@@ -473,13 +473,17 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 # ---------------------------------------------------------------------------
 
 def alfworld_reward(state: vf.State, **kwargs) -> float:
-    if not isinstance(state.get("metrics"), dict):
-        state["metrics"] = {}
-    state["metrics"].update({
-        "context_truncated": float(state.get("context_truncated", False)),
-        "context_evictions": float(state.get("context_evictions", 0)),
-    })
     return 1.0 if state.get("won", False) else 0.0
+
+
+def context_truncated(state: vf.State, **kwargs) -> float:
+    """Zero-weight metric: exposes state["context_truncated"] to W&B via rubric."""
+    return float(state.get("context_truncated", False))
+
+
+def context_evictions(state: vf.State, **kwargs) -> float:
+    """Zero-weight metric: exposes state["context_evictions"] to W&B via rubric."""
+    return float(state.get("context_evictions", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +532,9 @@ def load_environment(
     log_trajectories: str = "none",
 ) -> vf.Environment:
     rubric = vf.Rubric()
-    rubric.add_reward_func(alfworld_reward)
+    rubric.add_reward_func(alfworld_reward, weight=1.0)
+    rubric.add_reward_func(context_truncated, weight=0.0)
+    rubric.add_reward_func(context_evictions, weight=0.0)
 
     env = ALFWorldEnvironment(
         dataset=lambda: build_dataset(data_path, split),
