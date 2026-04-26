@@ -490,8 +490,87 @@ def context_evictions(state: vf.State, **kwargs) -> float:
 # Dataset builder
 # ---------------------------------------------------------------------------
 
-def build_dataset(data_path: str, split: str) -> Dataset:
-    """Scan game files under data_path/split and return a HuggingFace Dataset."""
+# ALFWorld task types — used to validate curriculum config and as the canonical set.
+KNOWN_TASK_TYPES: frozenset = frozenset([
+    "look_at_obj_in_light",
+    "pick_and_place_simple",
+    "pick_two_obj_and_place",
+    "pick_clean_then_place_in_recep",
+    "pick_heat_then_place_in_recep",
+    "pick_cool_then_place_in_recep",
+])
+
+
+def _task_type_from_game_file(game_file: str) -> str:
+    """Extract ALFWorld task type from a game-file path.
+
+    Path layout: .../<split>/<task_type>-<obj>-<recep>-<id>/<trial_dir>/game.tw-pddl
+    The task type is the prefix (before the first "-") of the second-to-last
+    directory component.
+
+    Returns the task type string (e.g. "look_at_obj_in_light").
+    """
+    parent = os.path.basename(os.path.dirname(os.path.dirname(game_file)))
+    return parent.split("-", 1)[0]
+
+
+def _curriculum_weights_for_task_type(
+    task_type: str,
+    curriculum: list,
+) -> list:
+    """Compute per-stage sampling weights for a task type.
+
+    For each stage in the curriculum, returns the weight assigned to this task
+    type. Falls back to stage["default"] if the task type is not explicitly
+    listed, else 0.0.
+
+    Args:
+        task_type: Task type string (e.g. "look_at_obj_in_light").
+        curriculum: List of stage dicts. Each stage maps task type names to
+            relative weights (float >= 0). Optional "default" key applies to
+            any task type not explicitly listed.
+
+    Returns:
+        List of floats — one per stage.
+    """
+    weights = []
+    for stage_idx, stage in enumerate(curriculum):
+        if not isinstance(stage, dict):
+            raise ValueError(
+                f"curriculum[{stage_idx}] must be a dict mapping task type to weight, "
+                f"got {type(stage).__name__}"
+            )
+        if task_type in stage:
+            weights.append(float(stage[task_type]))
+        elif "default" in stage:
+            weights.append(float(stage["default"]))
+        else:
+            weights.append(0.0)
+    return weights
+
+
+def build_dataset(
+    data_path: str,
+    split: str,
+    curriculum: list | None = None,
+) -> Dataset:
+    """Scan game files under data_path/split and return a HuggingFace Dataset.
+
+    If `curriculum` is provided, each row is annotated with a top-level
+    `curriculum_weights` field — a list of per-stage weights derived from the
+    row's task type. The Buffer reads `row["curriculum_weights"][stage]` to
+    compute the sampling probability for the row at the current stage.
+
+    Args:
+        data_path: Path to ALFWorld data root (containing split subdirectories).
+        split: Dataset split ("train" / "valid_seen" / "valid_unseen").
+        curriculum: Optional curriculum spec. List of stage dicts mapping task
+            type names (and optionally "default") to relative weights.
+
+    Returns:
+        HuggingFace Dataset with rows containing prompt, answer, info, and
+        (if curriculum is set) curriculum_weights.
+    """
     split_map = {
         "train": "train",
         "valid_seen": "valid_seen",
@@ -509,14 +588,31 @@ def build_dataset(data_path: str, split: str) -> Dataset:
     if not game_files:
         raise ValueError(f"No game.tw-pddl files found under {base_path}")
 
-    rows = [
-        {
+    if curriculum is not None:
+        # Validate referenced task types match known set; warn on unknowns.
+        referenced = set()
+        for stage in curriculum:
+            if isinstance(stage, dict):
+                referenced.update(k for k in stage.keys() if k != "default")
+        unknown = referenced - KNOWN_TASK_TYPES
+        if unknown:
+            logger.warning(
+                f"Curriculum references task types not in the known ALFWorld set: "
+                f"{sorted(unknown)}. These weights will not match any rows. "
+                f"Known types: {sorted(KNOWN_TASK_TYPES)}"
+            )
+
+    rows = []
+    for gf in game_files:
+        row = {
             "prompt": [{"role": "system", "content": SYSTEM_PROMPT}],
             "answer": "",
             "info": {"game_file": gf},
         }
-        for gf in game_files
-    ]
+        if curriculum is not None:
+            task_type = _task_type_from_game_file(gf)
+            row["curriculum_weights"] = _curriculum_weights_for_task_type(task_type, curriculum)
+        rows.append(row)
     return Dataset.from_list(rows)
 
 
@@ -530,6 +626,7 @@ def load_environment(
     max_turns: int = MAX_EPISODE_STEPS,
     max_context_tokens: int = -1,
     log_trajectories: str = "none",
+    curriculum: list | None = None,
 ) -> vf.Environment:
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
@@ -537,7 +634,7 @@ def load_environment(
     rubric.add_reward_func(context_evictions, weight=0.0)
 
     env = ALFWorldEnvironment(
-        dataset=lambda: build_dataset(data_path, split),
+        dataset=lambda: build_dataset(data_path, split, curriculum=curriculum),
         rubric=rubric,
         max_turns=max_turns,
         max_context_tokens=max_context_tokens,
