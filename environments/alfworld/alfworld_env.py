@@ -12,9 +12,12 @@ Context window truncation (optional, enabled when max_context_tokens > 0):
     The initial task observation (messages[1]) is evictable: losing it creates strong partial
     observability and maximally satisfies the strategic relevance test (two trajectories with
     identical recent context but different evicted tasks have widely divergent optimal actions).
-  - Token counting: one POST to vLLM /tokenize per turn on the full message list.
-    Exact counts, no local tokenizer needed. If the count exceeds the budget, messages are
-    popped one at a time from messages[1:] and re-counted until the budget is satisfied.
+  - Token counting: a locally-loaded HuggingFace tokenizer is applied with the model's chat
+    template (lazy-loaded on first use, one tokenizer per env worker process). Local
+    tokenization replaces an earlier design that POSTed to vLLM's /tokenize endpoint per turn;
+    that earlier design saturated vLLM's tokenizer thread pool under 64 concurrent multi-turn
+    rollouts and indirectly corrupted concurrent generation output (the eval-vs-training
+    divergence investigation, see diary 20260427-eval-training-divergence-investigation §3).
   - Truncation metrics written to state for §5 reporting:
       state["context_truncated"]          bool  — whether any eviction occurred this episode
       state["context_truncated_at_turn"]  int   — trajectory step index of first eviction
@@ -28,7 +31,6 @@ import re
 import threading
 from pathlib import Path
 
-import httpx
 import verifiers as vf
 from datasets import Dataset
 
@@ -84,10 +86,12 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         super().__init__(**kwargs)
         self.max_context_tokens = max_context_tokens
         self.log_trajectories = log_trajectories  # "none" | "wins" | "all"
-        # Shared httpx client across rollouts in this env worker process.
-        # Initialised lazily in _get_http_client() to avoid creating it at
-        # import time (before the asyncio event loop exists).
-        self._http_client: httpx.AsyncClient | None = None
+        # Local HF tokenizer for context-token counting. Lazy-loaded on first
+        # _count_tokens() call (typically from an EnvWorker process); the
+        # orchestrator process also instantiates ALFWorldEnvironment for buffer
+        # construction but never calls _count_tokens, so the tokenizer is never
+        # loaded there — saving ~200 MB resident in the orchestrator process.
+        self._tokenizer = None
 
     # ------------------------------------------------------------------
     # TextWorld helpers
@@ -149,44 +153,40 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     # Context window truncation
     # ------------------------------------------------------------------
 
-    async def _get_http_client(self) -> httpx.AsyncClient:
-        """Return a reusable async HTTP client for /tokenize calls."""
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=10.0)
-        return self._http_client
-
-    @staticmethod
-    def _derive_tokenize_url(state: vf.State) -> str:
-        """Derive the vLLM /tokenize URL from the inference client's base_url.
-
-        The client's base_url is the OpenAI-compatible root, e.g.
-        "http://localhost:8765/v1/". The /tokenize endpoint lives at the
-        server root (not under /v1), so we strip the /v1 suffix.
-        """
-        client = state["client"]
-        if hasattr(client, "client"):
-            # Live Client wrapper (orchestrator process)
-            base = str(client.client.base_url).rstrip("/")
-        else:
-            # ClientConfig (subprocess worker reconstruction)
-            base = str(client.api_base_url).rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-        return base.rstrip("/") + "/tokenize"
-
     async def _count_tokens(self, messages: vf.Messages, state: vf.State) -> int:
-        """Return the exact token count for messages via vLLM /tokenize.
+        """Return the exact token count for messages using a local HF tokenizer.
 
-        Sends the full message list with the chat template applied server-side.
-        add_generation_prompt=True matches what vLLM does before inference.
-        The URL is derived once per rollout and cached in state["_tokenize_url"].
+        Lazily loads the HuggingFace tokenizer for state["model"] on first call
+        (~200 MB, one-time cost per env worker process; reused across all rollouts
+        on this worker). Applies the model's chat template with
+        add_generation_prompt=True to match what vLLM does server-side before
+        inference — i.e. the count returned here equals what vLLM will see when
+        it receives the same message list.
+
+        This replaces an earlier implementation that POSTed to vLLM's /tokenize
+        endpoint. Under 64 concurrent multi-turn rollouts that earlier design
+        saturated vLLM's tokenizer thread pool and indirectly corrupted
+        concurrent generation output (see diary
+        20260427-eval-training-divergence-investigation §3). Local tokenization
+        eliminates the /tokenize traffic entirely.
+
+        Concurrency: this method is called from async coroutines on the env
+        worker's single asyncio event loop. The tokenizer call below is sync;
+        asyncio guarantees no concurrent execution within this coroutine, so
+        no locking is required despite HF Fast tokenizers being thread-unsafe
+        in the underlying Rust implementation.
         """
-        if "_tokenize_url" not in state:
-            state["_tokenize_url"] = self._derive_tokenize_url(state)
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            model_name = state["model"]
+            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            logger.info(
+                f"Loaded local tokenizer for {model_name} "
+                f"(env worker pid={os.getpid()})"
+            )
 
-        # Serialise messages to plain role/content dicts.
-        # The /tokenize endpoint applies the chat template server-side, so we
-        # only need role and content — no extra fields.
+        # Serialise messages to plain role/content dicts (matches what HF chat
+        # template expects).
         payload_messages = []
         for msg in messages:
             d = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg)
@@ -199,17 +199,14 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 )
             payload_messages.append({"role": role, "content": content})
 
-        http = await self._get_http_client()
-        response = await http.post(
-            state["_tokenize_url"],
-            json={
-                "model": state["model"],
-                "messages": payload_messages,
-                "add_generation_prompt": True,
-            },
+        # Apply chat template + tokenize. add_generation_prompt=True matches the
+        # vLLM /tokenize endpoint default and what vLLM does before inference.
+        token_ids = self._tokenizer.apply_chat_template(
+            payload_messages,
+            tokenize=True,
+            add_generation_prompt=True,
         )
-        response.raise_for_status()
-        return response.json()["count"]
+        return len(token_ids)
 
     async def _apply_sliding_window(
         self, messages: vf.Messages, state: vf.State
@@ -219,7 +216,8 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         messages[0] (system prompt) is always preserved.
         messages[1:] are eviction candidates, removed FIFO (oldest first).
 
-        After each eviction the token count is re-queried exactly via /tokenize.
+        After each eviction the token count is re-computed via _count_tokens
+        (local HF tokenizer; see its docstring for concurrency / lazy-load notes).
         In practice ALFWorld episodes evict at most 1-2 messages per turn, so
         the loop runs at most 2-3 iterations.
 
