@@ -78,12 +78,18 @@ async def vllm_count(client: httpx.AsyncClient, messages: list) -> int:
 
 
 def local_count(tokenizer, messages: list) -> int:
-    """Get local HF tokenizer count for a message list."""
-    token_ids = tokenizer.apply_chat_template(
+    """Get local HF tokenizer count for a message list.
+
+    Uses the string→encode two-step path. apply_chat_template(tokenize=True)
+    can return a BatchEncoding dict in some transformers versions, which
+    silently corrupts len() to 2.
+    """
+    text = tokenizer.apply_chat_template(
         messages,
-        tokenize=True,
+        tokenize=False,
         add_generation_prompt=True,
     )
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
     return len(token_ids)
 
 

@@ -199,13 +199,20 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 )
             payload_messages.append({"role": role, "content": content})
 
-        # Apply chat template + tokenize. add_generation_prompt=True matches the
-        # vLLM /tokenize endpoint default and what vLLM does before inference.
-        token_ids = self._tokenizer.apply_chat_template(
+        # Apply chat template, then tokenize as an explicit two-step. We do NOT
+        # use apply_chat_template(tokenize=True) directly: some transformers
+        # versions return a BatchEncoding dict (input_ids + attention_mask)
+        # rather than a flat token list, and len() of that dict is 2 — silently
+        # corrupting our token counts. The string→encode path is robust.
+        # add_generation_prompt=True matches what vLLM does before inference.
+        # add_special_tokens=False avoids double-adding BOS/EOS that the chat
+        # template already inserts (<|im_start|>...<|im_end|>).
+        text = self._tokenizer.apply_chat_template(
             payload_messages,
-            tokenize=True,
+            tokenize=False,
             add_generation_prompt=True,
         )
+        token_ids = self._tokenizer.encode(text, add_special_tokens=False)
         return len(token_ids)
 
     async def _apply_sliding_window(

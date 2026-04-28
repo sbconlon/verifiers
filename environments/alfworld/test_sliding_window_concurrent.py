@@ -55,11 +55,14 @@ class _CountTokensTester:
                 )
             payload_messages.append({"role": role, "content": content})
 
-        token_ids = self._tokenizer.apply_chat_template(
+        # Two-step path matches the production code; see alfworld_env.py
+        # for why apply_chat_template(tokenize=True) is unreliable.
+        text = self._tokenizer.apply_chat_template(
             payload_messages,
-            tokenize=True,
+            tokenize=False,
             add_generation_prompt=True,
         )
+        token_ids = self._tokenizer.encode(text, add_special_tokens=False)
         return len(token_ids)
 
 
