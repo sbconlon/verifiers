@@ -331,6 +331,8 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         state["context_truncated"] = False
         state["context_truncated_at_turn"] = None
         state["context_evictions"] = 0
+        state["num_admissible"] = 0
+        state["_last_admissible_commands"] = infos["admissible_commands"][0]
         initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
         state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
         return state
@@ -457,11 +459,16 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tw_env = state["alf_env"]
         action = self._parse_action(messages)
 
+        # Compare against the commands the model saw at choice time, not the post-step set.
+        if action in state.get("_last_admissible_commands", []):
+            state["num_admissible"] += 1
+
         def _step():
             with _TW_PARSE_LOCK:
                 return tw_env.step([action])
 
         obs, _reward, done, infos = await asyncio.to_thread(_step)
+        state["_last_admissible_commands"] = infos["admissible_commands"][0]
 
         content = self._format_obs(obs[0], infos["admissible_commands"][0])
         response = vf.UserMessage(content=content)
@@ -489,6 +496,12 @@ def context_truncated(state: vf.State, **kwargs) -> float:
 def context_evictions(state: vf.State, **kwargs) -> float:
     """Zero-weight metric: exposes state["context_evictions"] to W&B via rubric."""
     return float(state.get("context_evictions", 0))
+
+
+def admissible_action_rate(state: vf.State, **kwargs) -> float:
+    """Zero-weight metric: fraction of decisions whose parsed action was in the admissible set."""
+    n = len(state.get("trajectory", []))
+    return state.get("num_admissible", 0) / n if n > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +650,7 @@ def load_environment(
     rubric.add_reward_func(alfworld_reward, weight=1.0)
     rubric.add_reward_func(context_truncated, weight=0.0)
     rubric.add_reward_func(context_evictions, weight=0.0)
+    rubric.add_reward_func(admissible_action_rate, weight=0.0)
 
     env = ALFWorldEnvironment(
         dataset=lambda: build_dataset(data_path, split, curriculum=curriculum),
