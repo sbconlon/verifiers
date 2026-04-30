@@ -49,10 +49,12 @@ SYSTEM_PROMPT = (
 )
 
 FORMAT_REMINDER = (
-    "\n\nNow it's your turn to take an action. "
-    "You MUST enclose your reasoning within <think> </think> tags, "
-    "then choose one action from the list above and enclose it within "
-    "<action> </action> tags."
+    "\n\nNow it's your turn. Respond with EXACTLY this format:\n"
+    "<think>your reasoning here</think>\n"
+    "<action>your chosen action here</action>\n\n"
+    "Use the literal angle-bracket tags shown above. "
+    "Do NOT use square brackets -- the format must be "
+    "<action>command</action>, NOT [action]command[/action]."
 )
 
 # Per-process cache: game_file -> tw_env_id registered with textworld.gym.
