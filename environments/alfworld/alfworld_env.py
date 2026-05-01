@@ -334,6 +334,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         state["context_truncated_at_turn"] = None
         state["context_evictions"] = 0
         state["num_admissible"] = 0
+        state["num_format_compliant"] = 0
         state["_last_admissible_commands"] = infos["admissible_commands"][0]
         initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
         state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
@@ -465,6 +466,18 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         if action in state.get("_last_admissible_commands", []):
             state["num_admissible"] += 1
 
+        # Track format compliance: did the latest assistant message contain BOTH
+        # <think> and <action> tags? Strict format check (parallel to
+        # admissible_action_rate). Used as a zero-weight metric to detect
+        # format-decay during long-context generation or RL-induced schema drift.
+        for msg in reversed(messages):
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+            if role == "assistant":
+                content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+                if isinstance(content, str) and "<think>" in content and "<action>" in content:
+                    state["num_format_compliant"] += 1
+                break
+
         def _step():
             with _TW_PARSE_LOCK:
                 return tw_env.step([action])
@@ -504,6 +517,19 @@ def admissible_action_rate(state: vf.State, **kwargs) -> float:
     """Zero-weight metric: fraction of decisions whose parsed action was in the admissible set."""
     n = len(state.get("trajectory", []))
     return state.get("num_admissible", 0) / n if n > 0 else 0.0
+
+
+def format_compliance_rate(state: vf.State, **kwargs) -> float:
+    """Zero-weight metric: fraction of decisions whose assistant message contained
+    BOTH <think> and <action> tags.
+
+    Strict format check — parallel to admissible_action_rate but at the schema
+    level rather than the action-validity level. A drop in this metric during
+    GRPO indicates the model is regressing on the XML schema the SFT phase
+    established (Phase 4 SFT baseline: 100% compliance at every measured turn).
+    """
+    n = len(state.get("trajectory", []))
+    return state.get("num_format_compliant", 0) / n if n > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +679,7 @@ def load_environment(
     rubric.add_reward_func(context_truncated, weight=0.0)
     rubric.add_reward_func(context_evictions, weight=0.0)
     rubric.add_reward_func(admissible_action_rate, weight=0.0)
+    rubric.add_reward_func(format_compliance_rate, weight=0.0)
 
     env = ALFWorldEnvironment(
         dataset=lambda: build_dataset(data_path, split, curriculum=curriculum),
