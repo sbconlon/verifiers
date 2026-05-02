@@ -84,10 +84,23 @@ def _make_demangler(env):
 
 class ALFWorldEnvironment(vf.MultiTurnEnv):
 
-    def __init__(self, max_context_tokens: int = -1, log_trajectories: str = "none", **kwargs):
+    def __init__(
+        self,
+        max_context_tokens: int = -1,
+        log_trajectories: str = "none",
+        tokenizer_path: str | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.max_context_tokens = max_context_tokens
         self.log_trajectories = log_trajectories  # "none" | "wins" | "all"
+        # Explicit path/HF-id for the tokenizer used by _count_tokens. When set,
+        # overrides state["model"] (which is unreliable in LoRA + checkpoint-resume
+        # setups: vLLM advertises the adapter NAME, not a real path, so a
+        # naive AutoTokenizer.from_pretrained(state["model"]) fails). Set this
+        # to the base model path in load_environment kwargs whenever using LoRA.
+        # See diary 20260502 grpo-1.5b-sft-run-001 for the live diagnosis.
+        self._tokenizer_path = tokenizer_path
         # Local HF tokenizer for context-token counting. Lazy-loaded on first
         # _count_tokens() call (typically from an EnvWorker process); the
         # orchestrator process also instantiates ALFWorldEnvironment for buffer
@@ -158,12 +171,25 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     async def _count_tokens(self, messages: vf.Messages, state: vf.State) -> int:
         """Return the exact token count for messages using a local HF tokenizer.
 
-        Lazily loads the HuggingFace tokenizer for state["model"] on first call
-        (~200 MB, one-time cost per env worker process; reused across all rollouts
-        on this worker). Applies the model's chat template with
-        add_generation_prompt=True to match what vLLM does server-side before
-        inference — i.e. the count returned here equals what vLLM will see when
-        it receives the same message list.
+        Lazily loads the HuggingFace tokenizer on first call (~200 MB, one-time
+        cost per env worker process; reused across all rollouts on this worker).
+        Applies the model's chat template with add_generation_prompt=True to
+        match what vLLM does server-side before inference — i.e. the count
+        returned here equals what vLLM will see when it receives the same
+        message list.
+
+        Tokenizer source resolution (in priority order):
+          1. self._tokenizer_path (set via load_environment(tokenizer_path=...))
+          2. state["model"] — the served-model identifier from prime-rl
+
+        For LoRA setups, ALWAYS set tokenizer_path explicitly to the base model
+        path. state["model"] is unreliable there: when prime-rl resumes from a
+        checkpoint, vLLM serves the LoRA adapter under its `name` (e.g.
+        "grpo-1.5b-sft-run-001") which is not a real filesystem path and not
+        an HF Hub repo, so AutoTokenizer.from_pretrained on it raises OSError.
+        Tokenization is invariant under LoRA — adapters do not change the
+        tokenizer — so always use the base model path. See diary
+        20260502 grpo-1.5b-sft-run-001 (post-resume divergence triage).
 
         This replaces an earlier implementation that POSTed to vLLM's /tokenize
         endpoint. Under 64 concurrent multi-turn rollouts that earlier design
@@ -180,10 +206,23 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """
         if self._tokenizer is None:
             from transformers import AutoTokenizer
-            model_name = state["model"]
-            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer_source = self._tokenizer_path or state["model"]
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+            except OSError as e:
+                # Most common cause: LoRA setup where state["model"] is the
+                # adapter name (no on-disk tokenizer). Re-raise with a hint so
+                # the truncation try/except logs an actionable message.
+                raise OSError(
+                    f"Could not load tokenizer from {tokenizer_source!r}. "
+                    f"If using LoRA, set tokenizer_path explicitly in "
+                    f"load_environment kwargs to the base model path "
+                    f"(self._tokenizer_path={self._tokenizer_path!r}, "
+                    f"state['model']={state.get('model')!r}). "
+                    f"Original error: {e}"
+                ) from e
             logger.info(
-                f"Loaded local tokenizer for {model_name} "
+                f"Loaded local tokenizer for {tokenizer_source} "
                 f"(env worker pid={os.getpid()})"
             )
 
@@ -673,7 +712,18 @@ def load_environment(
     max_context_tokens: int = -1,
     log_trajectories: str = "none",
     curriculum: list | None = None,
+    tokenizer_path: str | None = None,
 ) -> vf.Environment:
+    """
+    Args:
+        tokenizer_path: Path/HF-id for the tokenizer used by the context-window
+            truncation logic. When set, overrides state["model"]. **REQUIRED**
+            for any LoRA-enabled run that resumes from a checkpoint: vLLM
+            advertises the LoRA adapter NAME (not a real path) in those setups,
+            and AutoTokenizer.from_pretrained on that name fails. Set this to
+            the base model path (e.g. "/workspace/sft-checkpoint" or
+            "Qwen/Qwen2.5-1.5B-Instruct"). Tokenization is LoRA-invariant.
+    """
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
     rubric.add_reward_func(context_truncated, weight=0.0)
@@ -687,6 +737,7 @@ def load_environment(
         max_turns=max_turns,
         max_context_tokens=max_context_tokens,
         log_trajectories=log_trajectories,
+        tokenizer_path=tokenizer_path,
         env_id="alfworld-env",
     )
     return env
