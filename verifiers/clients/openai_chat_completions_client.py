@@ -142,6 +142,60 @@ OpenAIChatResponse: TypeAlias = ChatCompletion
 OpenAITool: TypeAlias = ChatCompletionToolParam
 
 
+def _extract_top_k_token_ids_from_logprobs_content(
+    logprobs_content: Any,
+    is_dict: bool,
+) -> list[list[int]] | None:
+    """Phase 5: Extract per-position top-K candidate token IDs from a
+    ChatCompletion's logprobs content.
+
+    `logprobs_content` is the value of `response.choices[0].logprobs.content`
+    -- either a list of `ChatCompletionTokenLogprob` objects (when accessed
+    via the OpenAI Pydantic response model) or a list of dicts (when accessed
+    via the raw JSON path). Each entry has a `top_logprobs` list whose
+    members carry `.token_id` (a vLLM extension; not part of the OpenAI
+    standard response shape).
+
+    Returns the per-position list of top-K token-ID lists, OR None if top-K
+    data is unavailable -- i.e. the request did not ask for top-K
+    (`top_logprobs` is empty) OR vLLM did not include `token_id` on the
+    alternatives. Returning None preserves the GRPO-only path's behavior.
+    """
+    if not logprobs_content:
+        return None
+
+    # Probe the first entry to decide whether top_logprobs are present.
+    first = logprobs_content[0]
+    if is_dict:
+        first_top = first.get("top_logprobs")
+    else:
+        first_top = getattr(first, "top_logprobs", None)
+    if not first_top:
+        return None
+
+    extracted: list[list[int]] = []
+    for entry in logprobs_content:
+        if is_dict:
+            top_lps = entry.get("top_logprobs") or []
+        else:
+            top_lps = getattr(entry, "top_logprobs", None) or []
+        if not top_lps:
+            return None
+        ids: list[int] = []
+        for tl in top_lps:
+            if isinstance(tl, dict):
+                tid = tl.get("token_id")
+            else:
+                tid = getattr(tl, "token_id", None)
+            if tid is None:
+                # Missing token_id on at least one alternative -- abort and
+                # let the upstream path treat top-K as unavailable.
+                return None
+            ids.append(int(tid))
+        extracted.append(ids)
+    return extracted
+
+
 class OpenAIChatCompletionsClient(
     Client[
         AsyncOpenAI,
@@ -478,6 +532,20 @@ class OpenAIChatCompletionsClient(
                 )  # [seq_len, layers, topk]
             else:
                 routed_experts = None
+            # Phase 5: extract top-K candidate token IDs at each completion
+            # position when the request asked for them and vLLM included them.
+            completion_top_k_token_ids = _extract_top_k_token_ids_from_logprobs_content(
+                logprobs_content,
+                is_dict=has_logprobs_dict,
+            )
+            if (
+                completion_top_k_token_ids is not None
+                and len(completion_top_k_token_ids) != len(completion_ids)
+            ):
+                # Length mismatch is a sign the response shape doesn't match
+                # what we expect; drop the field rather than emit malformed data.
+                completion_top_k_token_ids = None
+
             return ResponseTokens(
                 prompt_ids=prompt_ids,
                 prompt_mask=prompt_mask,
@@ -485,6 +553,7 @@ class OpenAIChatCompletionsClient(
                 completion_mask=completion_mask,
                 completion_logprobs=completion_logprobs,
                 routed_experts=routed_experts,
+                completion_top_k_token_ids=completion_top_k_token_ids,
             )
 
         def parse_reasoning_content_from_response(

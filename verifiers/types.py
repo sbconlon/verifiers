@@ -164,6 +164,14 @@ class ResponseTokens(CustomBaseModel):
     completion_mask: list[int]
     completion_logprobs: list[float]
     routed_experts: list[list[list[int]]] | None = None  # [seq_len, layers, topk]
+    # Phase 5: per-completion-token top-K candidate token IDs for ARM regret
+    # matching. When non-None: outer length matches len(completion_ids); each
+    # inner list has length K (the action set size requested via vLLM's
+    # SamplingParams.logprobs=K). Populated only when the inference request
+    # asked for top-K logprobs and vLLM's response includes token IDs for
+    # alternatives. None for the GRPO path. Substitution to guarantee
+    # `sampled_id in row` is applied on the prime-rl orchestrator side.
+    completion_top_k_token_ids: list[list[int]] | None = None
 
 
 FinishReason = Literal["stop", "length", "tool_calls"] | None
@@ -201,6 +209,7 @@ class TrajectoryStepTokens(TypedDict):
     overlong_prompt: bool
     is_truncated: bool
     routed_experts: list[list[list[int]]] | None  # [seq_len, layers, topk]
+    completion_top_k_token_ids: list[list[int]] | None  # Phase 5: per-completion-token top-K candidate IDs (None for GRPO/PPO)
 
 
 class TokenUsage(TypedDict):

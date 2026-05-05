@@ -33,6 +33,8 @@ async def parse_response_tokens(
     completion_mask = tokens.completion_mask
     completion_logprobs = tokens.completion_logprobs
     routed_experts = tokens.routed_experts
+    # Phase 5: per-completion-token top-K candidate IDs (optional; None for GRPO).
+    completion_top_k_token_ids = getattr(tokens, "completion_top_k_token_ids", None)
 
     if max_seq_len is not None:
         prompt_len = len(prompt_ids)
@@ -46,6 +48,9 @@ async def parse_response_tokens(
             completion_mask = []
             completion_logprobs = []
             routed_experts = [] if routed_experts is not None else None
+            completion_top_k_token_ids = (
+                [] if completion_top_k_token_ids is not None else None
+            )
         elif prompt_len + completion_len > max_seq_len:
             is_truncated = True
             completion_ids = tokens.completion_ids[: max_seq_len - prompt_len]
@@ -53,6 +58,8 @@ async def parse_response_tokens(
             completion_logprobs = tokens.completion_logprobs[: max_seq_len - prompt_len]
             if routed_experts is not None:
                 routed_experts = routed_experts[: max_seq_len - prompt_len]
+            if completion_top_k_token_ids is not None:
+                completion_top_k_token_ids = completion_top_k_token_ids[: max_seq_len - prompt_len]
         else:
             is_truncated = False
     else:
@@ -68,4 +75,5 @@ async def parse_response_tokens(
         overlong_prompt=overlong_prompt,
         is_truncated=is_truncated,
         routed_experts=routed_experts,
+        completion_top_k_token_ids=completion_top_k_token_ids,
     )
