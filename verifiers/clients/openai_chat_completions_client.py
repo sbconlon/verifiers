@@ -152,14 +152,24 @@ def _extract_top_k_token_ids_from_logprobs_content(
     `logprobs_content` is the value of `response.choices[0].logprobs.content`
     -- either a list of `ChatCompletionTokenLogprob` objects (when accessed
     via the OpenAI Pydantic response model) or a list of dicts (when accessed
-    via the raw JSON path). Each entry has a `top_logprobs` list whose
-    members carry `.token_id` (a vLLM extension; not part of the OpenAI
-    standard response shape).
+    via the raw JSON path). Two paths to obtain the integer ID per
+    candidate:
 
-    Returns the per-position list of top-K token-ID lists, OR None if top-K
-    data is unavailable -- i.e. the request did not ask for top-K
-    (`top_logprobs` is empty) OR vLLM did not include `token_id` on the
-    alternatives. Returning None preserves the GRPO-only path's behavior.
+      (1) Legacy vLLM extension: each entry exposes a `.token_id` field
+          (older vLLM versions). Used when present.
+      (2) Encoded-token path: when prime-rl's orchestrator sets
+          `extra_body["return_tokens_as_token_ids"] = True` (vLLM 0.17+),
+          each candidate's `token` field is a string of the form
+          "token_id:N". vLLM 0.17 dropped the legacy `.token_id` field
+          on top_logprobs items (chat_completion/protocol.py: only
+          {token, logprob, bytes} remain), so this is the supported
+          escape hatch.
+
+    Returns the per-position list of top-K token-ID lists, OR None if
+    top-K data is unavailable -- i.e. the request did not ask for top-K
+    (`top_logprobs` is empty) OR neither path can recover the ID for at
+    least one alternative. Returning None preserves the GRPO-only path's
+    behavior.
     """
     if not logprobs_content:
         return None
@@ -173,6 +183,27 @@ def _extract_top_k_token_ids_from_logprobs_content(
     if not first_top:
         return None
 
+    def _resolve_token_id(tl: Any) -> int | None:
+        """Try (1) legacy `.token_id`, then (2) parse "token_id:N" from
+        the `token` string. Returns None if neither yields an integer."""
+        if isinstance(tl, dict):
+            tid = tl.get("token_id")
+            tok = tl.get("token")
+        else:
+            tid = getattr(tl, "token_id", None)
+            tok = getattr(tl, "token", None)
+        if tid is not None:
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(tok, str) and tok.startswith("token_id:"):
+            try:
+                return int(tok[len("token_id:"):])
+            except ValueError:
+                return None
+        return None
+
     extracted: list[list[int]] = []
     for entry in logprobs_content:
         if is_dict:
@@ -183,15 +214,12 @@ def _extract_top_k_token_ids_from_logprobs_content(
             return None
         ids: list[int] = []
         for tl in top_lps:
-            if isinstance(tl, dict):
-                tid = tl.get("token_id")
-            else:
-                tid = getattr(tl, "token_id", None)
+            tid = _resolve_token_id(tl)
             if tid is None:
-                # Missing token_id on at least one alternative -- abort and
-                # let the upstream path treat top-K as unavailable.
+                # Neither legacy nor encoded-token path yielded an ID --
+                # treat top-K as unavailable for this response.
                 return None
-            ids.append(int(tid))
+            ids.append(tid)
         extracted.append(ids)
     return extracted
 
