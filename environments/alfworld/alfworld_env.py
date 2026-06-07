@@ -27,6 +27,7 @@ import asyncio
 import datetime
 import logging
 import os
+import random
 import re
 import threading
 from pathlib import Path
@@ -89,11 +90,17 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         max_context_tokens: int = -1,
         log_trajectories: str = "none",
         tokenizer_path: str | None = None,
+        num_reasoning_blocks: int = 1,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.max_context_tokens = max_context_tokens
         self.log_trajectories = log_trajectories  # "none" | "wins" | "all"
+        # Action-level ARM (Phase 3): number of reasoning blocks m sampled per
+        # decision point for the RBMC pi_hat estimate. 1 == standard single
+        # generation (GRPO/PPO and any unconfigured run are then byte-for-byte
+        # unchanged). m=4 for action-level ARM (D-5).
+        self.num_reasoning_blocks = num_reasoning_blocks
         # Explicit path/HF-id for the tokenizer used by _count_tokens. When set,
         # overrides state["model"] (which is unreliable in LoRA + checkpoint-resume
         # setups: vLLM advertises the adapter NAME, not a real path, so a
@@ -343,6 +350,48 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     # Environment lifecycle
     # ------------------------------------------------------------------
 
+    async def get_model_response(self, state: vf.State, prompt: vf.Messages, *args, **kwargs):
+        """Action-level ARM (Phase 3): sample m reasoning blocks per decision point.
+
+        At m == 1 this is a literal passthrough to super().get_model_response, so
+        GRPO/PPO and any unconfigured run are unchanged. At m > 1 it issues m full
+        generations against the *same* prompt (the shared observation o, so vLLM
+        prefix-caches the o prefill and only the m decodes are new work), picks j*
+        uniformly (seeded for reproducibility), stashes all m responses + j* in
+        transient state, and returns the executed (j*-th) response.
+
+        A full generation samples (R_j, a_j) jointly and autoregressively
+        a_j ~ π(·|o, R_j); executing responses[j*] realizes the diary's "sample
+        R_{j*}, then a* ~ π(·|o, R_{j*})". The m-1 non-executed blocks' reasoning
+        is what Phase 4 teacher-forces to estimate the marginal π̂.
+
+        Stash contract consumed by Phase 4 (add_trajectory_step), overwritten each
+        turn, popped at rollout end (cleanup_alf_env) so it never serializes:
+            state["_pending_reasoning_blocks"]: list[Response]  # length m
+            state["_executed_block_idx"]:       int             # j*
+        """
+        m = self.num_reasoning_blocks
+        # super() must be resolved in method scope (zero-arg super() does not work
+        # inside the comprehension below); the bound method is then called m times.
+        parent_get_response = super().get_model_response
+        if m == 1:
+            return await parent_get_response(state, prompt, *args, **kwargs)
+
+        responses = await asyncio.gather(
+            *[parent_get_response(state, prompt, *args, **kwargs) for _ in range(m)]
+        )
+
+        # Uniform j*, seeded from (trajectory_id, turn) for reproducibility. A str
+        # seed gives random.Random a stable (sha512-derived) state -- deterministic
+        # across processes, unlike the hash-randomized built-in hash() on strings.
+        # len(trajectory) is this turn's index (the step is appended afterwards).
+        rng = random.Random(f"{state['trajectory_id']}:{len(state['trajectory'])}")
+        j_star = rng.randrange(m)
+
+        state["_pending_reasoning_blocks"] = list(responses)
+        state["_executed_block_idx"] = j_star
+        return responses[j_star]
+
     async def setup_state(self, state: vf.State) -> vf.State:
         # Defensive: ensure TMPDIR exists before any planner subprocess.
         # fast_downward (invoked transitively by tw_env.reset()) does
@@ -431,6 +480,12 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 tw_env.close()
             except Exception:
                 pass
+        # Action-level ARM (Phase 3): drop the transient m-block stash so it never
+        # serializes into the RolloutOutput (it carries raw Response objects and is
+        # consumed same-turn in Phase 4). Overwritten each turn; this is the
+        # belt-and-suspenders end-of-rollout pop.
+        state.pop("_pending_reasoning_blocks", None)
+        state.pop("_executed_block_idx", None)
 
     def _parse_action(self, messages: vf.Messages) -> str:
         """Extract action text from the last AssistantMessage.
@@ -783,6 +838,7 @@ def load_environment(
     log_trajectories: str = "none",
     curriculum: list | None = None,
     tokenizer_path: str | None = None,
+    num_reasoning_blocks: int = 1,
 ) -> vf.Environment:
     """
     Args:
@@ -808,6 +864,7 @@ def load_environment(
         max_context_tokens=max_context_tokens,
         log_trajectories=log_trajectories,
         tokenizer_path=tokenizer_path,
+        num_reasoning_blocks=num_reasoning_blocks,
         env_id="alfworld-env",
     )
     return env

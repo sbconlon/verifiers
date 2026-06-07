@@ -33,9 +33,16 @@ class _AssistantMessage:
 
 _vf_mock.MultiTurnEnv = _FakeMultiTurnEnv
 _vf_mock.AssistantMessage = _AssistantMessage
+_vf_mock.cleanup = lambda f: f  # identity decorator -> cleanup_alf_env stays callable
 sys.modules["verifiers"] = _vf_mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+# Force a fresh import of alfworld_env bound to THIS file's mock: other alfworld
+# test modules install their own verifiers mock and import alfworld_env too, and
+# the module is cached after the first import. Popping it isolates this file's
+# binding (otherwise we'd reuse a base class missing the methods we exercise).
+sys.modules.pop("environments.alfworld.alfworld_env", None)
 
 from environments.alfworld.alfworld_env import ALFWorldEnvironment  # noqa: E402
 
