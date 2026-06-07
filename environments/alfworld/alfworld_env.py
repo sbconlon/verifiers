@@ -459,6 +459,32 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 return text if text else content.strip()
         return "look"  # safe no-op if no model message found
 
+    async def add_trajectory_step(self, state: vf.State, trajectory_step: vf.TrajectoryStep) -> None:
+        """Action-level ARM (Phase 1): record this turn's admissible set + executed action.
+
+        At this hook for turn k, ``state["_last_admissible_commands"]`` still holds the
+        set the model saw when choosing this turn's action: env_response overwrites it
+        only on the *next* turn's get_prompt_messages, which runs after this step is
+        appended. The executed action is parsed from the just-generated completion via
+        the same _parse_action used by env_response (so a* matches what the engine
+        receives, including the "look" fallback on an unparsable completion).
+
+        We write the *raw* admissible set + executed-action text into the step extras.
+        prime-rl's interleave_rollout applies the union invariant
+        (substitute_executed_into_admissible) and builds TrainingSample.decision_points
+        from these keys. Keeping the union on the prime-rl side avoids duplicating the
+        invariant across repos (verifiers does not depend on prime_rl) and mirrors how
+        substitute_sampled_into_top_k is applied there for tokens.
+
+        Cross-repo extras contract (consumed by prime_rl.orchestrator.trajectories):
+            extras["admissible_actions"]: list[str]  # raw set, as the model saw it
+            extras["executed_action"]:    str        # parsed executed action a*
+        """
+        extras = trajectory_step.setdefault("extras", {})
+        extras["admissible_actions"] = list(state.get("_last_admissible_commands", []))
+        extras["executed_action"] = self._parse_action(trajectory_step["completion"])
+        await super().add_trajectory_step(state, trajectory_step)
+
     @staticmethod
     def _label_prompt(messages, step_idx: int) -> list[str]:
         """Assign global turn labels to the post-eviction messages for trajectory step step_idx.
