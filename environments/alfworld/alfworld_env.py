@@ -122,7 +122,12 @@ def _build_score_body(prompts_token_ids: list[list[int]], model: str, temperatur
         max_tokens=1,
         temperature=temperature,
         top_p=1.0,
-        extra_body=dict(prompt_logprobs=1),
+        # prompt_logprobs must be a TOP-LEVEL field: this body is sent via a raw
+        # client.token_client.post(body=...), which (unlike client.completions.create)
+        # does NOT merge an "extra_body" key into the request. Nesting it under
+        # extra_body made vLLM silently ignore it -> prompt_logprobs=None in the
+        # response -> NoneType subscript in _span_logprob_sum.
+        prompt_logprobs=1,
     )
 
 
