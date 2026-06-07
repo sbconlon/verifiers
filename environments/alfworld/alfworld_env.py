@@ -446,6 +446,19 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         if m == 1:
             return await parent_get_response(state, prompt, *args, **kwargs)
 
+        # Phase 8 (generation o-sharing): the m calls use the IDENTICAL `prompt`
+        # (the shared observation o), so vLLM's automatic prefix caching prefills
+        # o once and reuses its KV across the m decodes -- the "don't recompute o"
+        # saving for generation. This is the doc's Option A (zero-code) and REQUIRES
+        # the inference server to run with prefix caching enabled
+        # (enable_prefix_caching=True / not --no-enable-prefix-caching).
+        #
+        # Option B (one n=m request, vLLM decodes m sequences off one o prefill) is
+        # NOT used: the verifiers client (OpenAIChatCompletionsClient.get_response)
+        # hard-asserts exactly one choice per response, so n>1 would need a
+        # verifiers-core change. The auto-prefix-cache path already shares the o
+        # prefill, so the n=m win over it is marginal (one request vs m, slightly
+        # tighter decode batching) and deferred.
         responses = await asyncio.gather(
             *[parent_get_response(state, prompt, *args, **kwargs) for _ in range(m)]
         )
@@ -711,6 +724,16 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             reasoning_text = content.split("<action>")[0]
             base_ids = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
 
+            # Phase 8 (scoring o-sharing): every candidate prompt below is
+            # o_ids + encode(reasoning + <action>a</action>), so within a block the
+            # |A| prompts share the contiguous [o, R_j] prefix and across blocks
+            # they share [o]. vLLM automatic prefix caching therefore prefills
+            # [o, R_j] (and [o]) once and reuses it across the |A| scoring requests
+            # -- the "don't recompute o" saving for scoring. REQUIRES the inference
+            # server's prefix caching to be on. Risk (Phase 9 spike, DQ8): if
+            # prompt_logprobs forces a full prefill recompute and defeats the cache,
+            # the fallback is a custom cache-preserving /score route on the
+            # inference server (not built here -- gated on the spike result).
             prompts, spans = [], []
             for a in candidates:
                 full = self._tokenizer.encode(
