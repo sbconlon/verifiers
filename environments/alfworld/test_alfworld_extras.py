@@ -49,8 +49,11 @@ from environments.alfworld.alfworld_env import ALFWorldEnvironment  # noqa: E402
 
 def _env() -> ALFWorldEnvironment:
     # Bypass the heavy __init__ (TextWorld/alfworld); the override only needs
-    # _parse_action (stateless) and super().add_trajectory_step.
-    return ALFWorldEnvironment.__new__(ALFWorldEnvironment)
+    # _parse_action (stateless), num_reasoning_blocks (the Phase 4 gate; 1 here so
+    # only the Phase 1 metadata path runs), and super().add_trajectory_step.
+    env = ALFWorldEnvironment.__new__(ALFWorldEnvironment)
+    env.num_reasoning_blocks = 1
+    return env
 
 
 def _step(content: str | None) -> dict:

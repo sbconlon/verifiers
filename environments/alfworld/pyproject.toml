@@ -14,7 +14,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-include = ["alfworld_env.py"]
+# rbmc.py carries the action-level ARM RBMC math imported by alfworld_env.py at
+# rollout time; it must ship alongside the env module.
+include = ["alfworld_env.py", "rbmc.py"]
 
 [tool.verifiers.eval]
 num_examples = 5

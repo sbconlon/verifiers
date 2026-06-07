@@ -30,10 +30,13 @@ import os
 import random
 import re
 import threading
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, Optional
 
 import verifiers as vf
 from datasets import Dataset
+from openai import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +83,66 @@ def _make_demangler(env):
 
 
 # ---------------------------------------------------------------------------
+# Action-level ARM: teacher-forcing scorer (Phase 4)
+# ---------------------------------------------------------------------------
+# The pi_hat scorer lives in this (editable) env module rather than in the
+# verifiers core client: it is action-level-ARM-only, its sole caller is this
+# env, and co-locating it here keeps the change in one live-editable place
+# (consistent with Phase 2's "co-locate math with its caller"). It uses the
+# token client's public token_client.post to hit native /v1/completions with
+# prompt_logprobs -- no custom server route (custom_build_app only *adds* routes,
+# so the native endpoint survives the prime-rl wrapper).
+
+
+# Permissive response model for /v1/completions with prompt_logprobs. Each choice
+# carries prompt_logprobs: a list (indexed by prompt token position) where each
+# entry is None (first position) or a dict keyed by str(token_id) ->
+# {"logprob": float, "rank": int, "decoded_token": str}.
+class CompletionScoreChoice(BaseModel):
+    index: int
+    prompt_logprobs: Optional[list[Optional[dict[str, Any]]]] = None
+
+
+class CompletionWithPromptLogprobs(BaseModel):
+    choices: list[CompletionScoreChoice]
+
+
+def _build_score_body(prompts_token_ids: list[list[int]], model: str, temperature: float) -> dict:
+    """Build the /v1/completions body for pure scoring (no generation).
+
+    Neutral config (T=1, top_p=1, no penalties/bias) so prompt_logprobs are the
+    *raw* policy distribution -- pi_hat is renorm(log_softmax(z)) over A(o), and
+    T=1 is the identity that yields raw in either vLLM prompt_logprobs regime.
+    max_tokens=1 because a pure scoring call still forwards the prompt; we read
+    prompt_logprobs, not the generated token.
+    """
+    return dict(
+        model=model,
+        prompt=prompts_token_ids,  # vLLM accepts list[list[int]]
+        max_tokens=1,
+        temperature=temperature,
+        top_p=1.0,
+        extra_body=dict(prompt_logprobs=1),
+    )
+
+
+def _span_logprob_sum(choice_prompt_logprobs: list, prompt_token_ids: list[int], start: int, end: int) -> float:
+    """Sum actual-token logprobs over [start, end), read BY TOKEN-ID (not by rank
+    -- rank 0 is not guaranteed to be the actual token). Each prompt_logprobs[p]
+    is a dict {str(token_id): entry}; entry is a Mapping with a "logprob" key
+    (JSON-deserialized vLLM Logprob) or an object with a .logprob attribute."""
+    total = 0.0
+    for p in range(start, end):
+        tok = prompt_token_ids[p]
+        entry = choice_prompt_logprobs[p][str(tok)]
+        total += entry["logprob"] if isinstance(entry, Mapping) else entry.logprob
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
+
 
 class ALFWorldEnvironment(vf.MultiTurnEnv):
 
@@ -175,6 +236,34 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     # Context window truncation
     # ------------------------------------------------------------------
 
+    def _ensure_tokenizer(self, state: vf.State) -> None:
+        """Lazily load the local HF tokenizer (shared by _count_tokens and the
+        action-level pi_hat continuation tokenization). ~200 MB, one-time per env
+        worker process. Source resolution: self._tokenizer_path (set this to the
+        base model path for LoRA), else state["model"]."""
+        if self._tokenizer is not None:
+            return
+        from transformers import AutoTokenizer
+        tokenizer_source = self._tokenizer_path or state["model"]
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+        except OSError as e:
+            # Most common cause: LoRA setup where state["model"] is the adapter
+            # name (no on-disk tokenizer). Re-raise with a hint so the caller's
+            # try/except logs an actionable message.
+            raise OSError(
+                f"Could not load tokenizer from {tokenizer_source!r}. "
+                f"If using LoRA, set tokenizer_path explicitly in "
+                f"load_environment kwargs to the base model path "
+                f"(self._tokenizer_path={self._tokenizer_path!r}, "
+                f"state['model']={state.get('model')!r}). "
+                f"Original error: {e}"
+            ) from e
+        logger.info(
+            f"Loaded local tokenizer for {tokenizer_source} "
+            f"(env worker pid={os.getpid()})"
+        )
+
     async def _count_tokens(self, messages: vf.Messages, state: vf.State) -> int:
         """Return the exact token count for messages using a local HF tokenizer.
 
@@ -211,27 +300,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         no locking is required despite HF Fast tokenizers being thread-unsafe
         in the underlying Rust implementation.
         """
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
-            tokenizer_source = self._tokenizer_path or state["model"]
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
-            except OSError as e:
-                # Most common cause: LoRA setup where state["model"] is the
-                # adapter name (no on-disk tokenizer). Re-raise with a hint so
-                # the truncation try/except logs an actionable message.
-                raise OSError(
-                    f"Could not load tokenizer from {tokenizer_source!r}. "
-                    f"If using LoRA, set tokenizer_path explicitly in "
-                    f"load_environment kwargs to the base model path "
-                    f"(self._tokenizer_path={self._tokenizer_path!r}, "
-                    f"state['model']={state.get('model')!r}). "
-                    f"Original error: {e}"
-                ) from e
-            logger.info(
-                f"Loaded local tokenizer for {tokenizer_source} "
-                f"(env worker pid={os.getpid()})"
-            )
+        self._ensure_tokenizer(state)
 
         # Serialise messages to plain role/content dicts (matches what HF chat
         # template expects).
@@ -534,11 +603,157 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         Cross-repo extras contract (consumed by prime_rl.orchestrator.trajectories):
             extras["admissible_actions"]: list[str]  # raw set, as the model saw it
             extras["executed_action"]:    str        # parsed executed action a*
+            extras["pi_hat"]:             float       # action-level ARM only (Phase 4)
         """
         extras = trajectory_step.setdefault("extras", {})
-        extras["admissible_actions"] = list(state.get("_last_admissible_commands", []))
-        extras["executed_action"] = self._parse_action(trajectory_step["completion"])
+        admissible = list(state.get("_last_admissible_commands", []))
+        a_star = self._parse_action(trajectory_step["completion"])
+        extras["admissible_actions"] = admissible
+        extras["executed_action"] = a_star
+
+        # Action-level ARM (Phase 4): teacher-force-score the admissible actions
+        # against each stashed reasoning block (Phase 3), then leave-one-out
+        # average the conditionals at a* to estimate the marginal pi_hat(a*|o).
+        # Gated on m>1 (GRPO/PPO/token-ARM never enter this branch) and skipped on
+        # error turns. Failures are non-fatal: pi_hat is left unset and the
+        # decision point degrades to "no pi_hat" rather than killing the rollout.
+        blocks = state.get("_pending_reasoning_blocks")
+        j_star = state.get("_executed_block_idx")
+        if (
+            self.num_reasoning_blocks > 1
+            and blocks is not None
+            and j_star is not None
+            and state.get("error") is None
+        ):
+            try:
+                extras["pi_hat"] = await self._compute_pi_hat(
+                    state, blocks, j_star, admissible, a_star
+                )
+            except Exception as exc:
+                logger.warning(f"pi_hat computation failed; leaving it unset: {exc}")
+
+        # Drop the transient stash (consumed here; cleanup_alf_env pops it again
+        # defensively at rollout end).
+        state.pop("_pending_reasoning_blocks", None)
+        state.pop("_executed_block_idx", None)
+
         await super().add_trajectory_step(state, trajectory_step)
+
+    @staticmethod
+    def _common_prefix_len(a: list[int], b: list[int]) -> int:
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    def _action_continuation_ids(self, reasoning_text: str, action_text: str) -> list[int]:
+        """Token-ids of "<action>{action}</action>" as a continuation of the block's
+        reasoning, via in-context tokenization (encode the full text, slice off the
+        reasoning's common-prefix tokens). Slicing handles a BPE merge at the
+        </think>-><action> seam. The closing </action> terminator is load-bearing:
+        without it "go to cabinet 1" is a strict token-prefix of "go to cabinet 12"
+        and the shorter action gets a systematically inflated score (phase doc §14).
+        """
+        full = self._tokenizer.encode(
+            reasoning_text + "<action>" + action_text + "</action>",
+            add_special_tokens=False,
+        )
+        base = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
+        cpl = self._common_prefix_len(base, full)
+        return full[cpl:]
+
+    async def _compute_pi_hat(
+        self,
+        state: vf.State,
+        blocks: list,
+        j_star: int,
+        admissible: list[str],
+        a_star: str,
+    ) -> float:
+        """RBMC leave-one-out estimate of pi_hat(a*|o) from the m reasoning blocks.
+
+        For each block R_j: build [o, R_j, <action>a</action>] for every admissible
+        action a (re-encoding reasoning+action together so the </think>-><action>
+        BPE seam is handled, and scoring from the first divergent token so every
+        candidate shares the same conditioning prefix -- the shared seam token
+        cancels in the softmax). Teacher-force-score the batch (one /v1/completions
+        request), renormalize over A(o) to get pi(·|o, R_j), keep the conditional at
+        a*. Average across blocks leaving out the executed block j*
+        (rbmc_marginal_loo). Scored at T=1 / neutral so pi_hat is the raw marginal.
+        """
+        # rbmc ships alongside this module (pyproject include). Dual import covers
+        # both the installed top-level layout and the in-repo package layout.
+        try:
+            from rbmc import conditional_renorm, rbmc_marginal_loo
+        except ImportError:
+            from environments.alfworld.rbmc import conditional_renorm, rbmc_marginal_loo
+
+        self._ensure_tokenizer(state)
+
+        # Union invariant: a* must be among the scored candidates (the canonical
+        # helper is prime_rl.orchestrator.admissible.substitute_executed_into_admissible;
+        # replicated inline here because verifiers does not depend on prime_rl).
+        candidates = list(admissible)
+        if a_star in candidates:
+            a_star_idx = candidates.index(a_star)
+        else:
+            candidates.append(a_star)
+            a_star_idx = len(candidates) - 1
+
+        client = state["client"]
+        model = state["model"]
+        conditionals_at_astar: list[float] = []
+        for block in blocks:
+            o_ids = list(block.message.tokens.prompt_ids)
+            content = block.message.content or ""
+            reasoning_text = content.split("<action>")[0]
+            base_ids = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
+
+            prompts, spans = [], []
+            for a in candidates:
+                full = self._tokenizer.encode(
+                    reasoning_text + "<action>" + a + "</action>",
+                    add_special_tokens=False,
+                )
+                cpl = self._common_prefix_len(base_ids, full)
+                prompts.append(o_ids + full)
+                spans.append((len(o_ids) + cpl, len(o_ids) + len(full)))
+
+            logps = await self._score_continuations(client, prompts, spans, model)
+            cond = conditional_renorm(logps)
+            conditionals_at_astar.append(cond[a_star_idx])
+
+        return rbmc_marginal_loo(conditionals_at_astar, exclude_idx=j_star)
+
+    async def _score_continuations(
+        self,
+        client,
+        prompts_token_ids: list[list[int]],
+        spans: list[tuple[int, int]],
+        model: str,
+        temperature: float = 1.0,
+    ) -> list[float]:
+        """Teacher-force-score token-id prompts via native /v1/completions
+        (prompt_logprobs); return the summed actual-token logprob over each span.
+
+        Uses the token client's public token_client (base_url with trailing /v1
+        stripped) so POST "/v1/completions" hits the native endpoint. The actual
+        token at each scored position is known by construction, so logprobs are
+        read by token-id. Returns one value per prompt, aligned to spans.
+        """
+        body = _build_score_body(prompts_token_ids, model, temperature)
+        resp = await client.token_client.post(
+            "/v1/completions", body=body, cast_to=CompletionWithPromptLogprobs
+        )
+        out: list[float] = [0.0] * len(prompts_token_ids)
+        for choice in resp.choices:
+            start, end = spans[choice.index]
+            out[choice.index] = _span_logprob_sum(
+                choice.prompt_logprobs, prompts_token_ids[choice.index], start, end
+            )
+        return out
 
     @staticmethod
     def _label_prompt(messages, step_idx: int) -> list[str]:
