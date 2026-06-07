@@ -344,6 +344,17 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     # ------------------------------------------------------------------
 
     async def setup_state(self, state: vf.State) -> vf.State:
+        # Defensive: ensure TMPDIR exists before any planner subprocess.
+        # fast_downward (invoked transitively by tw_env.reset()) does
+        # tempfile.mkdtemp() + shutil.copy(libdownward.so, ...). If TMPDIR has
+        # been deleted out from under us mid-run (observed live 2026-05-02 on
+        # /workspace/tmp — root cause unknown but possibly wandb exit hooks or
+        # a subprocess atexit handler), every planner setup fails permanently
+        # and the orchestrator's retry loop spins forever. Idempotent mkdir is
+        # microsecond-cheap and self-heals against this whole failure class.
+        import tempfile as _tempfile
+        os.makedirs(_tempfile.gettempdir(), exist_ok=True)
+
         game_file = state["info"]["game_file"]
         logger.debug(f"setup_state: loading {game_file}")
         tw_env = await asyncio.to_thread(self._make_tw_env, game_file)
@@ -352,18 +363,51 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             with _TW_PARSE_LOCK:
                 return tw_env.reset()
 
-        try:
-            obs, infos = await asyncio.to_thread(_reset)
-        except Exception as exc:
-            # TextWorld 1.7.0 textgen parser fails on some game file templates.
-            # Re-raise as vf.Error so the framework catches it, records the
-            # episode as failed (reward 0.0), and keeps the worker alive.
-            logger.warning(f"setup_state: reset() failed for {game_file!r}: {exc}")
+        # Retry on transient OSError. The dominant case is MooseFS chunk-
+        # visibility lag during fast_downward's per-call libdownward.so copy:
+        # shutil.copyfile returns successfully, but when the planner subprocess
+        # immediately dlopen's the .so, not all 34 MB of chunks are consistently
+        # readable yet, so mmap of a PT_LOAD segment fails with "failed to map
+        # segment from shared object". Observed live 2026-05-03 on the GRPO
+        # run; manual cp+dlopen on the same path passes, confirming the failure
+        # is timing-dependent. 3 attempts with linear backoff (0.5s, 1.0s, 1.5s)
+        # covers the observed lag window. Non-OSError exceptions fall through
+        # to the original error path (e.g., TextWorld parser failures).
+        last_oserror = None
+        success = False
+        for attempt in range(3):
+            try:
+                obs, infos = await asyncio.to_thread(_reset)
+                success = True
+                break
+            except OSError as exc:
+                last_oserror = exc
+                logger.warning(
+                    f"setup_state: reset() OSError attempt {attempt + 1}/3 "
+                    f"for {game_file!r}: {exc}. "
+                    f"Retrying after {0.5 * (attempt + 1):.1f}s."
+                )
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as exc:
+                # Non-OSError - TextWorld 1.7.0 textgen parser failures, etc.
+                # Re-raise as vf.Error so the framework catches it, records the
+                # episode as failed (reward 0.0), and keeps the worker alive.
+                logger.warning(f"setup_state: reset() failed for {game_file!r}: {exc}")
+                try:
+                    tw_env.close()
+                except Exception:
+                    pass
+                raise vf.Error(f"setup_state failed for {game_file!r}: {exc}") from exc
+
+        if not success:
             try:
                 tw_env.close()
             except Exception:
                 pass
-            raise vf.Error(f"setup_state failed for {game_file!r}: {exc}") from exc
+            raise vf.Error(
+                f"setup_state failed for {game_file!r} after 3 OSError retries: "
+                f"{last_oserror}"
+            ) from last_oserror
 
         state["alf_env"] = tw_env
         state["won"] = False
