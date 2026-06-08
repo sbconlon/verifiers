@@ -797,35 +797,49 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
         client = state["client"]
         model = state["model"]
-        conditionals_at_astar: list[float] = []
+
+        # Phase 9 perf (CRITICAL): build ALL m x |A| scoring prompts and score them
+        # in ONE /v1/completions request, instead of one request per block. The
+        # per-block requests were an m x request multiplier that flooded the vLLM
+        # scheduler (300-deep prefill queue, GPU ~idle) -- the dominant Phase 9
+        # bottleneck. One request per decision point lets vLLM batch the whole
+        # prefill and chunk it, and keeps the queue shallow.
+        #
+        # Prompts are emitted block-by-block and each is
+        #   o_ids + encode(reasoning_j + <action>a</action>)
+        # so within a block the |A| prompts share the contiguous [o, R_j] prefix and
+        # across blocks they share [o]. Ordering them contiguously by block maximizes
+        # vLLM prefix-cache reuse: [o] prefills once, each [o, R_j] once, then the
+        # |A| action suffixes reuse it. (REQUIRES prefix caching on; raising
+        # max_num_batched_tokens lets vLLM admit this large batched prefill rather
+        # than serializing it 2-3 at a time.) Scored from the first divergent token
+        # so the shared seam token cancels in the per-block softmax.
+        all_prompts: list[list[int]] = []
+        all_spans: list[tuple[int, int]] = []
+        block_slices: list[tuple[int, int]] = []  # [start, end) into all_prompts per block
         for block in blocks:
             o_ids = list(block.message.tokens.prompt_ids)
             content = block.message.content or ""
             reasoning_text = content.split("<action>")[0]
             base_ids = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
 
-            # Phase 8 (scoring o-sharing): every candidate prompt below is
-            # o_ids + encode(reasoning + <action>a</action>), so within a block the
-            # |A| prompts share the contiguous [o, R_j] prefix and across blocks
-            # they share [o]. vLLM automatic prefix caching therefore prefills
-            # [o, R_j] (and [o]) once and reuses it across the |A| scoring requests
-            # -- the "don't recompute o" saving for scoring. REQUIRES the inference
-            # server's prefix caching to be on. Risk (Phase 9 spike, DQ8): if
-            # prompt_logprobs forces a full prefill recompute and defeats the cache,
-            # the fallback is a custom cache-preserving /score route on the
-            # inference server (not built here -- gated on the spike result).
-            prompts, spans = [], []
+            block_start = len(all_prompts)
             for a in candidates:
                 full = self._tokenizer.encode(
                     reasoning_text + "<action>" + a + "</action>",
                     add_special_tokens=False,
                 )
                 cpl = self._common_prefix_len(base_ids, full)
-                prompts.append(o_ids + full)
-                spans.append((len(o_ids) + cpl, len(o_ids) + len(full)))
+                all_prompts.append(o_ids + full)
+                all_spans.append((len(o_ids) + cpl, len(o_ids) + len(full)))
+            block_slices.append((block_start, len(all_prompts)))
 
-            logps = await self._score_continuations(client, prompts, spans, model)
-            cond = conditional_renorm(logps)
+        # Single request for the whole decision point's m x |A| prompts.
+        logps = await self._score_continuations(client, all_prompts, all_spans, model)
+
+        conditionals_at_astar: list[float] = []
+        for start, end in block_slices:
+            cond = conditional_renorm(logps[start:end])
             conditionals_at_astar.append(cond[a_star_idx])
 
         return rbmc_marginal_loo(conditionals_at_astar, exclude_idx=j_star)

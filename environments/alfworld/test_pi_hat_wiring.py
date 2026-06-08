@@ -75,14 +75,16 @@ def _completion(action):
 
 
 def _scorer_from_conditionals(per_block_probs):
-    """Fake _score_continuations: returns log(probs) for the call's block so that
-    conditional_renorm reproduces `probs` exactly. Call order == block order."""
-    state = {"call": 0}
+    """Fake _score_continuations. Phase 9 consolidation: _compute_pi_hat now makes
+    ONE call with all m x |A| prompts (blocks concatenated in order), so return the
+    flat concatenation of log(probs) -- _compute_pi_hat splits it back per block and
+    conditional_renorm reproduces each block's `probs` exactly."""
 
     async def fake(client, prompts, spans, model, temperature=1.0):
-        probs = per_block_probs[state["call"]]
-        state["call"] += 1
-        return [math.log(max(p, 1e-12)) for p in probs]
+        out: list[float] = []
+        for block in per_block_probs:
+            out.extend(math.log(max(p, 1e-12)) for p in block)
+        return out
 
     return fake
 
@@ -114,6 +116,33 @@ def test_pi_hat_loo_at_astar():
     assert step["extras"]["admissible_actions"] == admissible
     assert "_pending_reasoning_blocks" not in state
     assert "_executed_block_idx" not in state
+
+
+def test_pi_hat_single_scoring_request():
+    """Phase 9 consolidation: all m x |A| scoring prompts go in ONE request, not
+    one per block (the m x request multiplier that flooded the vLLM queue)."""
+    admissible = ["go", "look", "take"]  # |A| = 3
+    calls = {"n": 0, "n_prompts": 0}
+
+    async def counting_scorer(client, prompts, spans, model, temperature=1.0):
+        calls["n"] += 1
+        calls["n_prompts"] = len(prompts)
+        return [0.0] * len(prompts)  # uniform; value irrelevant to this test
+
+    env = _env(4, fake_scorer=counting_scorer)
+    state = {
+        "trajectory": [],
+        "_last_admissible_commands": admissible,
+        "_pending_reasoning_blocks": [_Block("<think>r</think><action>look</action>") for _ in range(4)],
+        "_executed_block_idx": 0,
+        "client": object(),
+        "model": "m",
+    }
+    step = {"completion": _completion("look"), "extras": {}}
+    asyncio.run(env.add_trajectory_step(state, step))
+    assert calls["n"] == 1  # ONE request for the whole decision point
+    assert calls["n_prompts"] == 4 * 3  # m x |A|
+    assert "pi_hat" in step["extras"]
 
 
 def test_m1_no_scoring():
