@@ -157,6 +157,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         log_trajectories: str = "none",
         tokenizer_path: str | None = None,
         num_reasoning_blocks: int = 1,
+        use_nm_fusion: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -167,6 +168,12 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # generation (GRPO/PPO and any unconfigured run are then byte-for-byte
         # unchanged). m=4 for action-level ARM (D-5).
         self.num_reasoning_blocks = num_reasoning_blocks
+        # Phase 8/9 perf: generate the m reasoning blocks with a single n=m request
+        # (vLLM prefills o once, samples m off it) instead of m separate requests
+        # that each re-prefill the long ALFWorld context. Critical for rollout
+        # throughput; falls back to m separate generations if the inference server
+        # doesn't return m token-complete choices.
+        self.use_nm_fusion = use_nm_fusion
         # Explicit path/HF-id for the tokenizer used by _count_tokens. When set,
         # overrides state["model"] (which is unreliable in LoRA + checkpoint-resume
         # setups: vLLM advertises the adapter NAME, not a real path, so a
@@ -451,33 +458,101 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         if m == 1:
             return await parent_get_response(state, prompt, *args, **kwargs)
 
-        # Phase 8 (generation o-sharing): the m calls use the IDENTICAL `prompt`
-        # (the shared observation o), so vLLM's automatic prefix caching prefills
-        # o once and reuses its KV across the m decodes -- the "don't recompute o"
-        # saving for generation. This is the doc's Option A (zero-code) and REQUIRES
-        # the inference server to run with prefix caching enabled
-        # (enable_prefix_caching=True / not --no-enable-prefix-caching).
-        #
-        # Option B (one n=m request, vLLM decodes m sequences off one o prefill) is
-        # NOT used: the verifiers client (OpenAIChatCompletionsClient.get_response)
-        # hard-asserts exactly one choice per response, so n>1 would need a
-        # verifiers-core change. The auto-prefix-cache path already shares the o
-        # prefill, so the n=m win over it is marginal (one request vs m, slightly
-        # tighter decode batching) and deferred.
-        responses = await asyncio.gather(
-            *[parent_get_response(state, prompt, *args, **kwargs) for _ in range(m)]
-        )
+        # Phase 8/9 perf (CRITICAL): generate the m reasoning blocks with ONE n=m
+        # request so vLLM prefills the (long ~5-9k-token) observation o ONCE and
+        # samples m sequences off it in a single batched decode. The fallback below
+        # -- m separate same-prompt requests -- relies on auto prefix caching, but
+        # concurrent identical requests do NOT share the prefill until one completes,
+        # so each re-prefills o: ~m x the prefill per turn, which dominated the
+        # >10 min/rollout seen at Phase 9. Fusion eliminates that.
+        responses = None
+        if getattr(self, "use_nm_fusion", True):
+            try:
+                responses = await self._generate_m_blocks_fused(state, prompt, m)
+            except Exception as exc:  # noqa: BLE001 -- never fail the rollout on fusion
+                logger.warning(
+                    f"n=m generation fusion failed ({exc!r}); falling back to m "
+                    "separate generations (slow). Check the inference server's n>1 "
+                    "support on /v1/chat/completions/tokens."
+                )
+                responses = None
+
+        if responses is None:
+            # Fallback: m separate same-prompt generations (auto-prefix-cache only;
+            # correct but slow on long contexts -- see above).
+            responses = list(
+                await asyncio.gather(
+                    *[parent_get_response(state, prompt, *args, **kwargs) for _ in range(m)]
+                )
+            )
 
         # Uniform j*, seeded from (trajectory_id, turn) for reproducibility. A str
         # seed gives random.Random a stable (sha512-derived) state -- deterministic
         # across processes, unlike the hash-randomized built-in hash() on strings.
         # len(trajectory) is this turn's index (the step is appended afterwards).
         rng = random.Random(f"{state['trajectory_id']}:{len(state['trajectory'])}")
-        j_star = rng.randrange(m)
+        j_star = rng.randrange(len(responses))
 
         state["_pending_reasoning_blocks"] = list(responses)
         state["_executed_block_idx"] = j_star
         return responses[j_star]
+
+    async def _generate_m_blocks_fused(self, state: vf.State, prompt, m: int):
+        """Generate the m reasoning blocks with a SINGLE n=m request (Phase 8/9).
+
+        Mirrors verifiers' Client.get_response but (a) sets sampling n=m so the
+        inference server prefills o once and samples m sequences in one batched
+        decode, and (b) slices the m returned choices into m vf.Response objects via
+        the client's own from_native_response parser -- so token_ids / logprobs are
+        extracted exactly as for a single generation, and the m blocks are i.i.d.
+        samples from pi(.|o) just like the m-separate path.
+
+        Returns the m responses, or None to signal the caller to fall back (server
+        returned < m choices, or a choice lacked per-token data -- meaning the
+        custom /tokens route didn't emit token ids for n>1, in which case the
+        m-separate fallback is the correct path).
+        """
+        client = state["client"]
+        model = state["model"]
+        sampling_args = {**(state.get("sampling_args") or {}), "n": m}
+        tools = state.get("tool_defs")
+
+        # Replicate Client.get_response's plumbing (headers + native conversion),
+        # but with n=m and multi-choice slicing.
+        call_kwargs = {"state": state}
+        headers = client._build_state_headers(state)
+        if headers:
+            call_kwargs["extra_headers"] = headers
+
+        native_prompt, extra_kwargs = await client.to_native_prompt(prompt)
+        native_tools = await client.to_native_tools(tools)
+        native = await client.get_native_response(
+            native_prompt, model, sampling_args, native_tools, **extra_kwargs, **call_kwargs
+        )
+
+        choices = getattr(native, "choices", None) or []
+        if len(choices) < m:
+            return None  # server did not honor n=m -> fall back
+
+        responses = []
+        for k in range(m):
+            single = native.model_copy(update={"choices": [choices[k]]})
+            await client.raise_from_native_response(single)
+            resp = await client.from_native_response(single)
+            # Each block needs per-token data (Phase 4 pi_hat + interleave both read
+            # response.message.tokens). If a choice lacks it, bail to the fallback.
+            if getattr(resp.message, "tokens", None) is None:
+                return None
+            responses.append(resp)
+
+        # Usage: native.usage covers the whole request (prompt + all m completions),
+        # so increment ONCE -- the m-separate path's m single-completion increments
+        # sum to the same total.
+        try:
+            self.increment_state_usage_from_response(state, responses[0])
+        except Exception:  # noqa: BLE001 -- usage tracking is best-effort
+            pass
+        return responses
 
     async def setup_state(self, state: vf.State) -> vf.State:
         # Defensive: ensure TMPDIR exists before any planner subprocess.
@@ -1082,6 +1157,7 @@ def load_environment(
     curriculum: list | None = None,
     tokenizer_path: str | None = None,
     num_reasoning_blocks: int = 1,
+    use_nm_fusion: bool = True,
 ) -> vf.Environment:
     """
     Args:
@@ -1108,6 +1184,7 @@ def load_environment(
         log_trajectories=log_trajectories,
         tokenizer_path=tokenizer_path,
         num_reasoning_blocks=num_reasoning_blocks,
+        use_nm_fusion=use_nm_fusion,
         env_id="alfworld-env",
     )
     return env

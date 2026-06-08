@@ -32,7 +32,10 @@ def test_build_score_body_shape():
     assert body["max_tokens"] == 1
     assert body["temperature"] == 1.0
     assert body["top_p"] == 1.0
-    assert body["extra_body"] == {"prompt_logprobs": 1}
+    # prompt_logprobs is a TOP-LEVEL field (cluster fix): the raw token_client.post
+    # does not merge an "extra_body" key, so nesting it there made vLLM ignore it.
+    assert body["prompt_logprobs"] == 1
+    assert "extra_body" not in body
 
 
 def test_span_sum_by_token_id():
