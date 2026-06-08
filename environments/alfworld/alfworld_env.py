@@ -158,6 +158,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tokenizer_path: str | None = None,
         num_reasoning_blocks: int = 1,
         use_nm_fusion: bool = True,
+        prewarm_pi_hat_prefixes: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -174,6 +175,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # throughput; falls back to m separate generations if the inference server
         # doesn't return m token-complete choices.
         self.use_nm_fusion = use_nm_fusion
+        # Phase 9 perf: pre-warm each [o, R_j] prefix into the prefix cache before the
+        # batched pi_hat scoring, so each action prompt reuses the ~2000-token prefix
+        # instead of recomputing it (a single batched request prefills its prompts
+        # simultaneously, which defeats in-batch prefix reuse). Set False to A/B it.
+        self.prewarm_pi_hat_prefixes = prewarm_pi_hat_prefixes
         # Explicit path/HF-id for the tokenizer used by _count_tokens. When set,
         # overrides state["model"] (which is unreliable in LoRA + checkpoint-resume
         # setups: vLLM advertises the adapter NAME, not a real path, so a
@@ -801,19 +807,23 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # Phase 9 perf (CRITICAL): build ALL m x |A| scoring prompts and score them
         # in ONE /v1/completions request, instead of one request per block. The
         # per-block requests were an m x request multiplier that flooded the vLLM
-        # scheduler (300-deep prefill queue, GPU ~idle) -- the dominant Phase 9
-        # bottleneck. One request per decision point lets vLLM batch the whole
-        # prefill and chunk it, and keeps the queue shallow.
+        # scheduler (300-deep prefill queue, GPU ~idle).
         #
-        # Prompts are emitted block-by-block and each is
-        #   o_ids + encode(reasoning_j + <action>a</action>)
-        # so within a block the |A| prompts share the contiguous [o, R_j] prefix and
-        # across blocks they share [o]. Ordering them contiguously by block maximizes
-        # vLLM prefix-cache reuse: [o] prefills once, each [o, R_j] once, then the
-        # |A| action suffixes reuse it. (REQUIRES prefix caching on; raising
-        # max_num_batched_tokens lets vLLM admit this large batched prefill rather
-        # than serializing it 2-3 at a time.) Scored from the first divergent token
-        # so the shared seam token cancels in the per-block softmax.
+        # Each prompt is o_ids + encode(reasoning_j + <action>a</action>), so within
+        # a block the |A| prompts share the contiguous [o, R_j] prefix (~2000 tok)
+        # and across blocks they share [o]. BUT a single batched request prefills
+        # all its prompts *simultaneously* within a scheduler step, so [o, R_j] is
+        # NOT cached before its |A| action prompts hit it -- each action would
+        # re-prefill the full ~2000-token prefix (~|A|x redundancy; observed as a
+        # 56% -> 31% prefix-cache hit-rate drop and a sustained-prefill wall).
+        #
+        # Fix: PRE-WARM each [o, R_j] prefix with a cheap forward FIRST (one batched
+        # request, awaited to completion), so the prefix is resident in the cache
+        # when the batched action scoring arrives. Each action prompt then reuses
+        # [o, R_j] and pays only its ~20-token action suffix. [o] itself is already
+        # hot from this turn's generation. (REQUIRES prefix caching on + a generous
+        # max_num_batched_tokens so the batched prefill is admitted, not serialized.)
+        prewarm_prefixes: list[list[int]] = []
         all_prompts: list[list[int]] = []
         all_spans: list[tuple[int, int]] = []
         block_slices: list[tuple[int, int]] = []  # [start, end) into all_prompts per block
@@ -822,6 +832,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             content = block.message.content or ""
             reasoning_text = content.split("<action>")[0]
             base_ids = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
+            prewarm_prefixes.append(o_ids + base_ids)  # [o, R_j] -- the shared prefix
 
             block_start = len(all_prompts)
             for a in candidates:
@@ -834,7 +845,17 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 all_spans.append((len(o_ids) + cpl, len(o_ids) + len(full)))
             block_slices.append((block_start, len(all_prompts)))
 
-        # Single request for the whole decision point's m x |A| prompts.
+        # Pre-warm the [o, R_j] prefixes into the prefix cache before scoring, so the
+        # batched action prompts reuse them instead of recomputing per action.
+        # Best-effort: a failure just means scoring pays the full prefill (slower).
+        if getattr(self, "prewarm_pi_hat_prefixes", True):
+            try:
+                await self._prewarm_prefixes(client, prewarm_prefixes, model)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"pi_hat prefix pre-warm skipped: {exc!r}")
+
+        # Single request for the whole decision point's m x |A| prompts (now mostly
+        # prefix-cache hits on [o, R_j]).
         logps = await self._score_continuations(client, all_prompts, all_spans, model)
 
         conditionals_at_astar: list[float] = []
@@ -843,6 +864,28 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             conditionals_at_astar.append(cond[a_star_idx])
 
         return rbmc_marginal_loo(conditionals_at_astar, exclude_idx=j_star)
+
+    async def _prewarm_prefixes(self, client, prefix_token_ids: list[list[int]], model: str) -> None:
+        """Prefill the [o, R_j] prefixes (one per reasoning block) so the subsequent
+        batched action scoring reuses them from vLLM's prefix cache.
+
+        A cheap 1-token completion still prefills (and thus caches) the whole prompt;
+        we discard the output. Awaited to completion so the cache is populated before
+        the scoring request is issued. No prompt_logprobs here -- this is pure cache
+        population. [o] is already hot from this turn's generation, so each prefix
+        only pays its own reasoning block's prefill (inherent), once instead of |A|x.
+        """
+        if not prefix_token_ids:
+            return
+        body = dict(
+            model=model,
+            prompt=prefix_token_ids,  # vLLM accepts list[list[int]]
+            max_tokens=1,
+            temperature=0.0,
+        )
+        await client.token_client.post(
+            "/v1/completions", body=body, cast_to=CompletionWithPromptLogprobs
+        )
 
     async def _score_continuations(
         self,
@@ -1172,6 +1215,7 @@ def load_environment(
     tokenizer_path: str | None = None,
     num_reasoning_blocks: int = 1,
     use_nm_fusion: bool = True,
+    prewarm_pi_hat_prefixes: bool = True,
 ) -> vf.Environment:
     """
     Args:
@@ -1199,6 +1243,7 @@ def load_environment(
         tokenizer_path=tokenizer_path,
         num_reasoning_blocks=num_reasoning_blocks,
         use_nm_fusion=use_nm_fusion,
+        prewarm_pi_hat_prefixes=prewarm_pi_hat_prefixes,
         env_id="alfworld-env",
     )
     return env

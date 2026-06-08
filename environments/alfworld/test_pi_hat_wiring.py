@@ -145,6 +145,79 @@ def test_pi_hat_single_scoring_request():
     assert "pi_hat" in step["extras"]
 
 
+class _FakeTokenClient:
+    def __init__(self):
+        self.posts = []
+
+    async def post(self, path, body, cast_to=None):
+        self.posts.append(body)
+
+        class _Empty:
+            choices: list = []
+
+        return _Empty()
+
+
+class _FakeClientWithToken:
+    def __init__(self):
+        self.token_client = _FakeTokenClient()
+
+
+def test_pi_hat_prewarms_prefixes_once():
+    """Phase 9 fix: each [o, R_j] prefix is pre-warmed into the cache in ONE batched
+    request (m prefixes) before the action scoring, so the batched scoring reuses it
+    instead of recomputing the ~2000-token prefix per action."""
+    admissible = ["go", "look", "take"]
+    score_calls = {"n": 0}
+
+    async def scorer(client, prompts, spans, model, temperature=1.0):
+        score_calls["n"] += 1
+        return [0.0] * len(prompts)
+
+    fake_client = _FakeClientWithToken()
+    env = _env(4, fake_scorer=scorer)
+    state = {
+        "trajectory": [],
+        "_last_admissible_commands": admissible,
+        "_pending_reasoning_blocks": [_Block("<think>r</think><action>look</action>") for _ in range(4)],
+        "_executed_block_idx": 0,
+        "client": fake_client,
+        "model": "m",
+    }
+    step = {"completion": _completion("look"), "extras": {}}
+    asyncio.run(env.add_trajectory_step(state, step))
+    # One pre-warm request carrying the m=4 [o, R_j] prefixes, then one scoring call.
+    assert len(fake_client.token_client.posts) == 1
+    assert len(fake_client.token_client.posts[0]["prompt"]) == 4
+    assert "prompt_logprobs" not in fake_client.token_client.posts[0]  # cheap, no logprobs
+    assert score_calls["n"] == 1
+
+
+def test_pi_hat_prewarm_disabled():
+    """prewarm_pi_hat_prefixes=False skips the pre-warm (A/B knob)."""
+    score_calls = {"n": 0}
+
+    async def scorer(client, prompts, spans, model, temperature=1.0):
+        score_calls["n"] += 1
+        return [0.0] * len(prompts)
+
+    fake_client = _FakeClientWithToken()
+    env = _env(3, fake_scorer=scorer)
+    env.prewarm_pi_hat_prefixes = False
+    state = {
+        "trajectory": [],
+        "_last_admissible_commands": ["go", "look"],
+        "_pending_reasoning_blocks": [_Block("<think>r</think><action>look</action>") for _ in range(3)],
+        "_executed_block_idx": 0,
+        "client": fake_client,
+        "model": "m",
+    }
+    step = {"completion": _completion("look"), "extras": {}}
+    asyncio.run(env.add_trajectory_step(state, step))
+    assert len(fake_client.token_client.posts) == 0  # no pre-warm
+    assert score_calls["n"] == 1
+
+
 def test_m1_no_scoring():
     env = _env(1)
     state = {"trajectory": [], "_last_admissible_commands": ["look"]}
