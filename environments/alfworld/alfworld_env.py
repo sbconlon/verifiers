@@ -107,6 +107,11 @@ class CompletionWithPromptLogprobs(BaseModel):
     choices: list[CompletionScoreChoice]
 
 
+# Response of the custom /v1/score route: one summed span logprob per prompt.
+class ScoreResponse(BaseModel):
+    scores: list[float]
+
+
 def _build_score_body(prompts_token_ids: list[list[int]], model: str, temperature: float) -> dict:
     """Build the /v1/completions body for pure scoring (no generation).
 
@@ -159,6 +164,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         num_reasoning_blocks: int = 1,
         use_nm_fusion: bool = True,
         prewarm_pi_hat_prefixes: bool = True,
+        use_score_route: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -180,6 +186,10 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # instead of recomputing it (a single batched request prefills its prompts
         # simultaneously, which defeats in-batch prefix reuse). Set False to A/B it.
         self.prewarm_pi_hat_prefixes = prewarm_pi_hat_prefixes
+        # Phase 9 perf: use the custom /v1/score route (server-side span summation,
+        # one float per prompt) instead of pulling full per-position prompt_logprobs
+        # over /v1/completions. Falls back to /v1/completions if the route is absent.
+        self.use_score_route = use_score_route
         # Explicit path/HF-id for the tokenizer used by _count_tokens. When set,
         # overrides state["model"] (which is unreliable in LoRA + checkpoint-resume
         # setups: vLLM advertises the adapter NAME, not a real path, so a
@@ -895,14 +905,65 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         model: str,
         temperature: float = 1.0,
     ) -> list[float]:
-        """Teacher-force-score token-id prompts via native /v1/completions
-        (prompt_logprobs); return the summed actual-token logprob over each span.
+        """Return the summed actual-token logprob over each prompt's span.
 
-        Uses the token client's public token_client (base_url with trailing /v1
-        stripped) so POST "/v1/completions" hits the native endpoint. The actual
-        token at each scored position is known by construction, so logprobs are
-        read by token-id. Returns one value per prompt, aligned to spans.
+        Phase 9 fix: prefer the custom /v1/score route, which computes the span sums
+        SERVER-side and returns one float per prompt -- avoiding the full-prompt
+        prompt_logprobs payload (len(prompt) logprob dicts per prompt) that was the
+        cache-invariant throughput wall. Falls back to the /v1/completions
+        prompt_logprobs path if /v1/score is unavailable (older inference server),
+        so correctness is preserved either way.
         """
+        if getattr(self, "use_score_route", True):
+            try:
+                return await self._score_via_route(
+                    client, prompts_token_ids, spans, model, temperature
+                )
+            except Exception as exc:  # noqa: BLE001 -- fall back, never fail scoring
+                logger.warning(
+                    f"/v1/score failed ({exc!r}); falling back to /v1/completions "
+                    "prompt_logprobs (full-payload, slower)."
+                )
+        return await self._score_via_completions(
+            client, prompts_token_ids, spans, model, temperature
+        )
+
+    async def _score_via_route(
+        self,
+        client,
+        prompts_token_ids: list[list[int]],
+        spans: list[tuple[int, int]],
+        model: str,
+        temperature: float,
+    ) -> list[float]:
+        """POST to the custom /v1/score route (server-side span summation -> tiny
+        response: one float per prompt)."""
+        body = dict(
+            model=model,
+            prompts=prompts_token_ids,
+            spans=[[int(s), int(e)] for s, e in spans],
+            temperature=temperature,
+            top_p=1.0,
+        )
+        resp = await client.token_client.post("/v1/score", body=body, cast_to=ScoreResponse)
+        scores = list(resp.scores)
+        if len(scores) != len(prompts_token_ids):
+            raise ValueError(
+                f"/v1/score returned {len(scores)} scores for {len(prompts_token_ids)} prompts"
+            )
+        return scores
+
+    async def _score_via_completions(
+        self,
+        client,
+        prompts_token_ids: list[list[int]],
+        spans: list[tuple[int, int]],
+        model: str,
+        temperature: float = 1.0,
+    ) -> list[float]:
+        """Fallback scorer via native /v1/completions prompt_logprobs (full per-position
+        payload). The actual token at each scored position is known by construction,
+        so logprobs are read by token-id. One value per prompt, aligned to spans."""
         body = _build_score_body(prompts_token_ids, model, temperature)
         resp = await client.token_client.post(
             "/v1/completions", body=body, cast_to=CompletionWithPromptLogprobs
@@ -1216,6 +1277,7 @@ def load_environment(
     num_reasoning_blocks: int = 1,
     use_nm_fusion: bool = True,
     prewarm_pi_hat_prefixes: bool = True,
+    use_score_route: bool = True,
 ) -> vf.Environment:
     """
     Args:
@@ -1244,6 +1306,7 @@ def load_environment(
         num_reasoning_blocks=num_reasoning_blocks,
         use_nm_fusion=use_nm_fusion,
         prewarm_pi_hat_prefixes=prewarm_pi_hat_prefixes,
+        use_score_route=use_score_route,
         env_id="alfworld-env",
     )
     return env
