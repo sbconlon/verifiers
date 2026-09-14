@@ -24,12 +24,14 @@ Context window truncation (optional, enabled when max_context_tokens > 0):
       state["context_evictions"]          int   — total messages evicted across the episode
 """
 import asyncio
+import contextlib
 import datetime
 import logging
 import os
 import random
 import re
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +69,43 @@ FORMAT_REMINDER = (
 _TW_ENV_ID_CACHE: dict[str, str] = {}
 _TW_REGISTER_LOCK = threading.Lock()
 _TW_PARSE_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _logged_parse_lock(phase: str, game_file: str):
+    """Instrumented acquire/hold/release of the process-global _TW_PARSE_LOCK.
+
+    Emits INFO lines so wedge diagnosis is disciplined instead of guessed. These
+    land in the per-worker ``env_worker_<id>.log`` ONLY when the process that
+    spawns the env server passes ``log_dir`` (the RL orchestrator and the
+    warm-start collect both must, or worker logs go nowhere -- see
+    vf_utils.spawn_env_server, which forces console_logging=False).
+
+    Reading the log:
+      * ``HOLDING ... phase=P game=G`` with NO matching ``released`` line for the
+        same (game,pid) => that rollout is WEDGED inside phase P (make | reset |
+        step) holding the lock. G + pid is the culprit; py-spy the pid.
+      * ``waiting ... game=G'`` with no later ``HOLDING`` for G' => G' is a VICTIM
+        blocked behind the culprit, not itself broken.
+      * ``held=<t>s`` on the ``released`` line distinguishes a SLOW grounding
+        (large but finite t) from an INFINITE wedge (no released line at all).
+    """
+    pid = os.getpid()
+    logger.info(f"[lock] waiting  phase={phase} game={game_file} pid={pid}")
+    t_wait = time.monotonic()
+    with _TW_PARSE_LOCK:
+        t_held = time.monotonic()
+        logger.info(
+            f"[lock] HOLDING  phase={phase} game={game_file} pid={pid} "
+            f"waited={t_held - t_wait:.2f}s"
+        )
+        try:
+            yield
+        finally:
+            logger.info(
+                f"[lock] released phase={phase} game={game_file} pid={pid} "
+                f"held={time.monotonic() - t_held:.2f}s"
+            )
 
 
 def _make_demangler(env):
@@ -247,7 +286,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """
         import textworld.gym
         tw_env_id = self._get_tw_env_id(game_file)
-        with _TW_PARSE_LOCK:
+        with _logged_parse_lock("make", game_file):
             return textworld.gym.make(tw_env_id)
 
     @staticmethod
@@ -587,7 +626,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tw_env = await asyncio.to_thread(self._make_tw_env, game_file)
 
         def _reset():
-            with _TW_PARSE_LOCK:
+            with _logged_parse_lock("reset", game_file):
                 return tw_env.reset()
 
         # Retry on transient OSError. The dominant case is MooseFS chunk-
@@ -1082,7 +1121,35 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             with _TW_PARSE_LOCK:
                 return tw_env.step([action])
 
-        obs, _reward, done, infos = await asyncio.to_thread(_step)
+        # Guard against fast_downward planner hangs: a specific game/state can wedge the
+        # planner subprocess inside tw_env.step and (via the shared _TW_PARSE_LOCK) stall
+        # every rollout in the worker indefinitely -- invisible to the router heartbeat,
+        # which runs on the free event loop. Time the step out so the rollout errors and is
+        # dropped/retried instead of hanging evaluate/collect forever. Normal steps are <1s.
+        #
+        # Steps are NOT wrapped in _logged_parse_lock (would emit ~15 lines/rollout of
+        # noise that buries the reset-wedge signal). Instead we surface only the anomalies:
+        # a >120s timeout (this step, or a reset wedge holding the lock ahead of it) and a
+        # merely-slow step. Fast steps stay silent.
+        game_file = state.get("info", {}).get("game_file", "?")
+        _t_step = time.monotonic()
+        try:
+            obs, _reward, done, infos = await asyncio.wait_for(
+                asyncio.to_thread(_step), timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[lock] STEP-TIMEOUT (>120s) game={game_file} pid={os.getpid()} "
+                f"action={action!r} -- step blocked, likely behind a wedged reset "
+                f"holding _TW_PARSE_LOCK (cross-check the [lock] HOLDING lines)."
+            )
+            raise
+        _dt_step = time.monotonic() - _t_step
+        if _dt_step > 5.0:
+            logger.warning(
+                f"[lock] SLOW-STEP game={game_file} pid={os.getpid()} "
+                f"took={_dt_step:.2f}s action={action!r}"
+            )
         state["_last_admissible_commands"] = infos["admissible_commands"][0]
 
         content = self._format_obs(obs[0], infos["admissible_commands"][0])
@@ -1199,6 +1266,7 @@ def build_dataset(
     data_path: str,
     split: str,
     curriculum: list | None = None,
+    task_types: list[str] | None = None,
 ) -> Dataset:
     """Scan game files under data_path/split and return a HuggingFace Dataset.
 
@@ -1231,8 +1299,18 @@ def build_dataset(
                 game_files.append(os.path.join(root, fname))
     game_files.sort()
 
+    # Optional task-type filter (e.g. task_types=["pick_and_place_simple"]) -> restrict
+    # collect / RL to a single ALFWorld type. Uses the same path->type parse as the
+    # curriculum weighting, so it composes with (or replaces) the curriculum.
+    if task_types is not None:
+        allowed = set(task_types)
+        game_files = [gf for gf in game_files if _task_type_from_game_file(gf) in allowed]
+
     if not game_files:
-        raise ValueError(f"No game.tw-pddl files found under {base_path}")
+        raise ValueError(
+            f"No game.tw-pddl files found under {base_path}"
+            + (f" for task_types={task_types}" if task_types is not None else "")
+        )
 
     if curriculum is not None:
         # Validate referenced task types match known set; warn on unknowns.
@@ -1273,6 +1351,7 @@ def load_environment(
     max_context_tokens: int = -1,
     log_trajectories: str = "none",
     curriculum: list | None = None,
+    task_types: list[str] | None = None,
     tokenizer_path: str | None = None,
     num_reasoning_blocks: int = 1,
     use_nm_fusion: bool = True,
@@ -1297,7 +1376,7 @@ def load_environment(
     rubric.add_reward_func(format_compliance_rate, weight=0.0)
 
     env = ALFWorldEnvironment(
-        dataset=lambda: build_dataset(data_path, split, curriculum=curriculum),
+        dataset=lambda: build_dataset(data_path, split, curriculum=curriculum, task_types=task_types),
         rubric=rubric,
         max_turns=max_turns,
         max_context_tokens=max_context_tokens,
