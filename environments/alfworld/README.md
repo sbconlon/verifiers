@@ -48,6 +48,7 @@ Optional mode used by the prime-rl orchestrator's probe hook (plan
 | probe_block_min_p | float | 0.1 | `min_p` for the sampled blocks (training value) |
 | oracle | str | "off" | `off` / `handcoded` (alfworld `HandCodedTWAgent` run in-env) / `planner` (engine `policy_commands`, slow) |
 | store_raw_logps | bool | False | Keep the raw m x \|A\| span logprobs in the record |
+| pi_hat_renorm | bool | True | True: per-block conditionals are the softmax over the admissible union; False: raw sequence probabilities, no renormalization (D-13). Applies to training and probe capture |
 
 `extras["probe"]` fields: `schema`, `admissible_union`, `executed_idx`,
 `parsed_ok`, `exec_block`, `blocks[j].{reasoning,action,cond}`,

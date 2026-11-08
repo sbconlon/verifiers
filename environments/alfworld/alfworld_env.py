@@ -225,6 +225,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         probe_block_min_p: float = 0.1,
         oracle: str = "off",
         store_raw_logps: bool = False,
+        pi_hat_renorm: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -281,6 +282,14 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         self.probe_block_min_p = probe_block_min_p
         self.oracle = oracle
         self.store_raw_logps = store_raw_logps
+        # pi_hat convention (training-probe D-13, 2026-11-07). True: each block's
+        # conditionals are the softmax over the admissible union (rows sum to 1,
+        # the convention every run before warm-003 used). False: the raw sequence
+        # probabilities exp(summed logp) with no renormalization, so pi_hat(a*) is
+        # the probability of emitting the action string itself and the per-block
+        # admissible mass exp(Z_j) <= 1 is left in the record for inspection.
+        # Applies to BOTH the training path (_compute_pi_hat) and probe capture.
+        self.pi_hat_renorm = pi_hat_renorm
 
     # ------------------------------------------------------------------
     # TextWorld helpers
@@ -1086,16 +1095,23 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         conditionals are the raw policy.
 
         Returns a PiHatMatrix (rbmc.py): candidates (admissible union), a_star_idx,
-        cond[m][|A|], Z[m] (per-block log-sum-exp renormalizer), raw[m][|A|]. The
+        cond[m][|A|] (softmax over the union when self.pi_hat_renorm, else the raw
+        sequence probabilities exp(logp); D-13), Z[m] (per-block log-sum-exp, the
+        admissible mass whether or not it was applied), raw[m][|A|]. The
         training path reduces it to the leave-one-out scalar at a* (_compute_pi_hat);
         the probe capture path records all of it (_write_probe_extras).
         """
         # rbmc ships alongside this module (pyproject include). Dual import covers
         # both the installed top-level layout and the in-repo package layout.
         try:
-            from rbmc import PiHatMatrix, conditional_renorm, logsumexp
+            from rbmc import PiHatMatrix, conditional_renorm, logsumexp, raw_probs
         except ImportError:
-            from environments.alfworld.rbmc import PiHatMatrix, conditional_renorm, logsumexp
+            from environments.alfworld.rbmc import (
+                PiHatMatrix,
+                conditional_renorm,
+                logsumexp,
+                raw_probs,
+            )
 
         self._ensure_tokenizer(state)
 
@@ -1158,15 +1174,18 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # prefix-cache hits on [o, R_j]).
         logps = await self._score_continuations(client, all_prompts, all_spans, model)
 
+        renorm = bool(getattr(self, "pi_hat_renorm", True))
         cond: list[list[float]] = []
         Z: list[float] = []
         raw: list[list[float]] = []
         for start, end in block_slices:
             row = list(logps[start:end])
             raw.append(row)
-            cond.append(conditional_renorm(row))
+            cond.append(conditional_renorm(row) if renorm else raw_probs(row))
             Z.append(logsumexp(row))
-        return PiHatMatrix(candidates=candidates, a_star_idx=a_star_idx, cond=cond, Z=Z, raw=raw)
+        return PiHatMatrix(
+            candidates=candidates, a_star_idx=a_star_idx, cond=cond, Z=Z, raw=raw, renormalized=renorm
+        )
 
     async def _compute_pi_hat(
         self,
@@ -1231,6 +1250,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         oracle = state.get("_probe_oracle_last") or _ORACLE_OFF
         probe: dict[str, Any] = {
             "schema": PROBE_SCHEMA_VERSION,
+            "pi_hat_renorm": bool(getattr(self, "pi_hat_renorm", True)),
             "admissible_union": candidates,
             "executed_idx": a_star_idx,
             "parsed_ok": re.search(r"<action>.*?</action>", completion_text, re.DOTALL) is not None,
@@ -1776,6 +1796,7 @@ def load_environment(
     probe_block_min_p: float = 0.1,
     oracle: str = "off",
     store_raw_logps: bool = False,
+    pi_hat_renorm: bool = True,
 ) -> vf.Environment:
     """
     Args:
@@ -1797,6 +1818,10 @@ def load_environment(
         oracle: "off" | "handcoded" (alfworld HandCodedTWAgent in-env) | "planner"
             (engine policy_commands; slow, fast_downward per step).
         store_raw_logps: keep the raw m x |A| span logprobs in the probe record.
+        pi_hat_renorm: True = per-block conditionals are the softmax over the
+            admissible union (the pre-2026-11-07 convention); False = raw sequence
+            probabilities, no renormalization (training-probe D-13). Applies to
+            the training path and to probe capture alike.
     """
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
@@ -1831,6 +1856,7 @@ def load_environment(
         probe_block_min_p=probe_block_min_p,
         oracle=oracle,
         store_raw_logps=store_raw_logps,
+        pi_hat_renorm=pi_hat_renorm,
         env_id="alfworld-env",
     )
     return env

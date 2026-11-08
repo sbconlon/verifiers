@@ -34,6 +34,21 @@ def conditional_renorm(action_logprobs: list[float]) -> list[float]:
     return [e / total for e in exps]
 
 
+def raw_probs(action_logprobs: list[float]) -> list[float]:
+    """Unnormalized counterpart of conditional_renorm: exp(lp_a) for each action.
+
+    action_logprobs[a] is the summed token logprob of the action string
+    "<action>a</action>" as a continuation of [o, R_j], so exp(lp_a) is the raw
+    probability the policy emits exactly that action after R_j. The entries sum
+    to exp(logsumexp(action_logprobs)) <= 1 (mass outside the admissible set is
+    not redistributed). Selected by ALFWorldEnvironment(pi_hat_renorm=False);
+    the training-probe plan's D-13 records why.
+    """
+    if not action_logprobs:
+        raise ValueError("action_logprobs must be non-empty")
+    return [math.exp(lp) for lp in action_logprobs]
+
+
 def rbmc_marginal(conditionals_per_block: list[float]) -> float:
     """Full RBMC marginal (1/m) Σ_j c_j for one target action.
 
@@ -83,9 +98,13 @@ class PiHatMatrix:
     candidates: the admissible union (env's raw admissible set with a* appended
         if absent) -- the index space of every per-action vector.
     a_star_idx: index of the executed action in ``candidates``.
-    cond[j][a]: π(a | o, R_j) renormalized over ``candidates`` (row sums to 1).
-    Z[j]: logsumexp of block j's raw summed span logprobs.
+    cond[j][a]: π(a | o, R_j) renormalized over ``candidates`` (row sums to 1)
+        when ``renormalized``; otherwise the raw sequence probability
+        exp(raw[j][a]) (row sums to exp(Z[j]) <= 1). See rbmc.raw_probs.
+    Z[j]: logsumexp of block j's raw summed span logprobs (the admissible mass
+        in log space; the normalizer whether or not it was applied).
     raw[j][a]: the raw summed span logprobs before renormalization.
+    renormalized: which of the two ``cond`` conventions this matrix uses.
 
     Produced by ALFWorldEnvironment._score_pi_hat_matrix; the training path
     reduces it to the leave-one-out scalar at a* (_compute_pi_hat), the probe
@@ -97,6 +116,7 @@ class PiHatMatrix:
     cond: list[list[float]]
     Z: list[float]
     raw: list[list[float]]
+    renormalized: bool = True
 
     def marginal(self) -> list[float]:
         """Plain RBMC marginal per action: column mean of ``cond`` over blocks."""
