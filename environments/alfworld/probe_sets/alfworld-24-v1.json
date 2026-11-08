@@ -1,0 +1,273 @@
+{
+  "name": "alfworld-24-v1",
+  "schema": 1,
+  "source": "phase6a-golden-graph/data/per_problem.csv (GRPO 2x2: long_ctx=16k, short_ctx=2k; pass@1 over 8 rollouts; oracle = TextWorld walkthrough)",
+  "rule": "per (split, task_type): bite = long>=0.75 with max (long-short), ties -> longer oracle, then game_id; control = long,short>=0.875, different task dir than the bite, ties -> longer oracle, then game_id",
+  "created": "2026-11-07",
+  "games": [
+    {
+      "probe_id": "seen-look-bite",
+      "game_id": "valid_seen/look_at_obj_in_light-Box-None-DeskLamp-205/trial_T20190907_074425_330493",
+      "split": "valid_seen",
+      "task_type": "look_at_obj_in_light",
+      "role": "bite",
+      "oracle_min_steps": 4,
+      "long_pass1": 0.75,
+      "short_pass1": 0.25,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-look-control",
+      "game_id": "valid_seen/look_at_obj_in_light-Bowl-None-DeskLamp-301/trial_T20190909_150719_492274",
+      "split": "valid_seen",
+      "task_type": "look_at_obj_in_light",
+      "role": "control",
+      "oracle_min_steps": 4,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-bite",
+      "game_id": "valid_seen/pick_and_place_simple-CreditCard-None-Drawer-227/trial_T20190909_010644_297017",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "bite",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.125,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-control",
+      "game_id": "valid_seen/pick_and_place_simple-SoapBottle-None-Cabinet-414/trial_T20190908_110131_524518",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "control",
+      "oracle_min_steps": 5,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-clean-bite",
+      "game_id": "valid_seen/pick_clean_then_place_in_recep-ButterKnife-None-Drawer-30/trial_T20190908_052007_212776",
+      "split": "valid_seen",
+      "task_type": "pick_clean_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-clean-control",
+      "game_id": "valid_seen/pick_clean_then_place_in_recep-Lettuce-None-Fridge-19/trial_T20190908_100138_446072",
+      "split": "valid_seen",
+      "task_type": "pick_clean_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-cool-bite",
+      "game_id": "valid_seen/pick_cool_then_place_in_recep-Apple-None-Microwave-19/trial_T20190906_210937_878489",
+      "split": "valid_seen",
+      "task_type": "pick_cool_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-cool-control",
+      "game_id": "valid_seen/pick_cool_then_place_in_recep-Lettuce-None-CounterTop-1/trial_T20190908_042713_075616",
+      "split": "valid_seen",
+      "task_type": "pick_cool_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 6,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-heat-bite",
+      "game_id": "valid_seen/pick_heat_then_place_in_recep-Cup-None-Cabinet-22/trial_T20190907_173251_960848",
+      "split": "valid_seen",
+      "task_type": "pick_heat_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-heat-control",
+      "game_id": "valid_seen/pick_heat_then_place_in_recep-Egg-None-Fridge-14/trial_T20190909_091314_636733",
+      "split": "valid_seen",
+      "task_type": "pick_heat_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 7,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-two-bite",
+      "game_id": "valid_seen/pick_two_obj_and_place-Knife-None-Drawer-18/trial_T20190907_065232_689984",
+      "split": "valid_seen",
+      "task_type": "pick_two_obj_and_place",
+      "role": "bite",
+      "oracle_min_steps": 9,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-two-control",
+      "game_id": "valid_seen/pick_two_obj_and_place-AlarmClock-None-Dresser-305/trial_T20190907_165826_194855",
+      "split": "valid_seen",
+      "task_type": "pick_two_obj_and_place",
+      "role": "control",
+      "oracle_min_steps": 8,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-look-bite",
+      "game_id": "valid_unseen/look_at_obj_in_light-Book-None-DeskLamp-308/trial_T20190908_020029_636862",
+      "split": "valid_unseen",
+      "task_type": "look_at_obj_in_light",
+      "role": "bite",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.375,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-look-control",
+      "game_id": "valid_unseen/look_at_obj_in_light-AlarmClock-None-DeskLamp-308/trial_T20190908_222917_366542",
+      "split": "valid_unseen",
+      "task_type": "look_at_obj_in_light",
+      "role": "control",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-bite",
+      "game_id": "valid_unseen/pick_and_place_simple-PepperShaker-None-Drawer-10/trial_T20190906_184021_215264",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "bite",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-control",
+      "game_id": "valid_unseen/pick_and_place_simple-Vase-None-Safe-219/trial_T20190908_205221_748352",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "control",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-clean-bite",
+      "game_id": "valid_unseen/pick_clean_then_place_in_recep-Egg-None-Microwave-10/trial_T20190909_120632_691361",
+      "split": "valid_unseen",
+      "task_type": "pick_clean_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-clean-control",
+      "game_id": "valid_unseen/pick_clean_then_place_in_recep-SoapBar-None-Cabinet-424/trial_T20190908_214946_567644",
+      "split": "valid_unseen",
+      "task_type": "pick_clean_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-cool-bite",
+      "game_id": "valid_unseen/pick_cool_then_place_in_recep-Potato-None-Microwave-10/trial_T20190907_033228_194678",
+      "split": "valid_unseen",
+      "task_type": "pick_cool_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-cool-control",
+      "game_id": "valid_unseen/pick_cool_then_place_in_recep-Tomato-None-Microwave-10/trial_T20190909_102710_795182",
+      "split": "valid_unseen",
+      "task_type": "pick_cool_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-heat-bite",
+      "game_id": "valid_unseen/pick_heat_then_place_in_recep-Apple-None-GarbageCan-10/trial_T20190908_145356_918528",
+      "split": "valid_unseen",
+      "task_type": "pick_heat_then_place_in_recep",
+      "role": "bite",
+      "oracle_min_steps": 6,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-heat-control",
+      "game_id": "valid_unseen/pick_heat_then_place_in_recep-Apple-None-Fridge-10/trial_T20190906_182353_418140",
+      "split": "valid_unseen",
+      "task_type": "pick_heat_then_place_in_recep",
+      "role": "control",
+      "oracle_min_steps": 7,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-two-bite",
+      "game_id": "valid_unseen/pick_two_obj_and_place-PepperShaker-None-Drawer-10/trial_T20190912_221016_460197",
+      "split": "valid_unseen",
+      "task_type": "pick_two_obj_and_place",
+      "role": "bite",
+      "oracle_min_steps": 9,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-two-control",
+      "game_id": "valid_unseen/pick_two_obj_and_place-ToiletPaper-None-Cabinet-424/trial_T20190906_202926_527010",
+      "split": "valid_unseen",
+      "task_type": "pick_two_obj_and_place",
+      "role": "control",
+      "oracle_min_steps": 9,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    }
+  ]
+}
