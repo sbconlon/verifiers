@@ -307,6 +307,7 @@ def test_probe_matrix_shapes_and_marginal():
     assert p["schema"] == 1
     assert p["admissible_union"] == ["go north", "look", "take apple 1 from table 1"]
     assert p["executed_idx"] == 1
+    assert p["n_admissible"] == 3
     assert p["parsed_ok"] is True
     assert p["exec_block"] == {
         "reasoning": "<think>r</think>",
@@ -359,6 +360,7 @@ def test_inadmissible_astar_appended_in_probe_record():
     p = step["extras"]["probe"]
     assert p["admissible_union"] == ["go north", "look", "open fridge 1"]
     assert p["executed_idx"] == 2
+    assert p["n_admissible"] == 2  # the appended a* sits at index >= n_admissible
     assert step["extras"]["pi_hat"] == pytest.approx(p["pi_hat_marginal"][2])
 
 

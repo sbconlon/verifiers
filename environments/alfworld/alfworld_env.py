@@ -1333,6 +1333,9 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             "schema": PROBE_SCHEMA_VERSION,
             "pi_hat_renorm": bool(getattr(self, "pi_hat_renorm", True)),
             "admissible_union": candidates,
+            # the raw admissible count: candidates[n_admissible:] is the executed
+            # action appended by the union invariant (an inadmissible a*)
+            "n_admissible": len(admissible),
             "executed_idx": a_star_idx,
             "parsed_ok": re.search(r"<action>.*?</action>", completion_text, re.DOTALL) is not None,
             "exec_block": {
