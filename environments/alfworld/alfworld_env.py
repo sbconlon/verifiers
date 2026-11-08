@@ -1187,6 +1187,71 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             candidates=candidates, a_star_idx=a_star_idx, cond=cond, Z=Z, raw=raw, renormalized=renorm
         )
 
+    async def _score_pi_hat_astar(
+        self,
+        state: vf.State,
+        blocks: list,
+        a_star: str,
+        skip_idx: int | None = None,
+    ) -> list[float]:
+        """Teacher-force-score ONLY the executed action a* against the reasoning
+        blocks the estimator uses (every block except ``skip_idx``).
+
+        The training-path shortcut for pi_hat_renorm=False (D-13, 2026-11-07).
+        Without the softmax over the admissible union, block j's value at a* is
+        the raw sequence probability exp(logp(<action>a*</action> | o, R_j)) and
+        depends on no other candidate, so the other |A|-1 prompts per block are
+        dead weight -- and so is block j* itself, which the leave-one-out mean
+        drops. Each prompt is built exactly as in _score_pi_hat_matrix (o_ids +
+        the re-encoded reasoning_j + "<action>a*</action>", scored from the first
+        token that diverges from the bare reasoning, so the </think>-><action>
+        BPE seam is handled identically) and the whole decision point goes out
+        in ONE _score_continuations call, after the same best-effort [o, R_j]
+        pre-warm (prewarm_pi_hat_prefixes). Note the pre-warm buys nothing here:
+        with a single prompt per prefix there is no in-batch redundancy to
+        remove, so it only adds the prefill it was meant to share.
+
+        Returns rbmc.raw_probs of the per-block span logprobs, in block order
+        with the skipped block absent (len(blocks) - 1 values when skip_idx is a
+        valid index, len(blocks) otherwise).
+        """
+        try:
+            from rbmc import raw_probs
+        except ImportError:
+            from environments.alfworld.rbmc import raw_probs
+
+        self._ensure_tokenizer(state)
+        client = state["client"]
+        model = state["model"]
+
+        prewarm_prefixes: list[list[int]] = []
+        prompts: list[list[int]] = []
+        spans: list[tuple[int, int]] = []
+        for j, block in enumerate(blocks):
+            if j == skip_idx:
+                continue
+            o_ids = list(block.message.tokens.prompt_ids)
+            content = block.message.content or ""
+            reasoning_text = content.split("<action>")[0]
+            base_ids = self._tokenizer.encode(reasoning_text, add_special_tokens=False)
+            prewarm_prefixes.append(o_ids + base_ids)  # [o, R_j] -- the shared prefix
+            full = self._tokenizer.encode(
+                reasoning_text + "<action>" + a_star + "</action>",
+                add_special_tokens=False,
+            )
+            cpl = self._common_prefix_len(base_ids, full)
+            prompts.append(o_ids + full)
+            spans.append((len(o_ids) + cpl, len(o_ids) + len(full)))
+
+        if getattr(self, "prewarm_pi_hat_prefixes", True):
+            try:
+                await self._prewarm_prefixes(client, prewarm_prefixes, model)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"pi_hat prefix pre-warm skipped: {exc!r}")
+
+        logps = await self._score_continuations(client, prompts, spans, model)
+        return raw_probs(list(logps))
+
     async def _compute_pi_hat(
         self,
         state: vf.State,
@@ -1202,14 +1267,30 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         hold-out structure of RLOO). Probe capture: j_star is None (the executed
         response was a separate greedy generation, no sampled block produced a*), so
         the plain mean over all m blocks is the right estimate (rbmc_marginal).
+
+        Scoring cost per decision point. With pi_hat_renorm=True the softmax over
+        the admissible union needs every candidate, so the full m x |A| matrix is
+        scored (_score_pi_hat_matrix). With pi_hat_renorm=False (D-13) the value at
+        a* is the raw sequence probability and depends on no other candidate, so
+        only "<action>a*</action>" is scored, and only under the blocks the
+        estimator uses: m - 1 prompts (j* skipped) on the training path, m when
+        j_star is None (_score_pi_hat_astar). The reduction is the same in both
+        cases; the unscored j* slot holds 0.0, which rbmc_marginal_loo subtracts
+        back out exactly, so the estimate equals the matrix path's to rounding.
+        probe_capture=True always keeps the full matrix (the record needs it).
         """
         try:
             from rbmc import rbmc_marginal, rbmc_marginal_loo
         except ImportError:
             from environments.alfworld.rbmc import rbmc_marginal, rbmc_marginal_loo
 
-        mat = await self._score_pi_hat_matrix(state, blocks, admissible, a_star)
-        conditionals_at_astar = [row[mat.a_star_idx] for row in mat.cond]
+        renorm = bool(getattr(self, "pi_hat_renorm", True))
+        if not renorm and not getattr(self, "probe_capture", False):
+            scored = iter(await self._score_pi_hat_astar(state, blocks, a_star, skip_idx=j_star))
+            conditionals_at_astar = [0.0 if j == j_star else next(scored) for j in range(len(blocks))]
+        else:
+            mat = await self._score_pi_hat_matrix(state, blocks, admissible, a_star)
+            conditionals_at_astar = [row[mat.a_star_idx] for row in mat.cond]
         if j_star is None:
             return rbmc_marginal(conditionals_at_astar)
         return rbmc_marginal_loo(conditionals_at_astar, exclude_idx=j_star)

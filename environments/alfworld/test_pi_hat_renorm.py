@@ -146,7 +146,12 @@ def test_training_path_default_unchanged_golden():
 
 
 def test_training_path_raw_loo():
-    env = _env(4, probe=False, raw_rows=RAW4, renorm=False)
+    # pi_hat_renorm=False scores only <action>a*</action> under the m-1 held-out
+    # blocks (_score_pi_hat_astar; a* at idx 3, j*=2 skipped), so the positional
+    # fake sees 3 prompts and answers the a* column of RAW4 for blocks 0, 1, 3.
+    # The request shape and the equality with the matrix path are pinned in
+    # test_pi_hat_score_astar.py.
+    env = _env(4, probe=False, raw_rows=[[RAW4[j][3]] for j in (0, 1, 3)], renorm=False)
     state = _train_state([_Block(f"<think>r{j}</think><action>open drawer 1</action>") for j in range(4)], 2)
     step = {"completion": _completion("open drawer 1"), "extras": {}}
     asyncio.run(env.add_trajectory_step(state, step))

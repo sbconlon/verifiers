@@ -56,6 +56,8 @@ Optional mode used by the prime-rl orchestrator's probe hook (plan
 `oracle.{action,status,plan,steps_left}`. Contract: prime-rl KB
 `plan/training-probe/probe-schema.md` §1.
 
+Cost per decision point: probe capture always scores the full `m x |A|` matrix, and so does the training path with `pi_hat_renorm=True` (the softmax needs every candidate); with `pi_hat_renorm=False` the training path scores only `<action>a*</action>` under the `m - 1` held-out blocks, i.e. `m - 1` prompts instead of `m x |A|` (`_compute_pi_hat` -> `_score_pi_hat_astar`).
+
 ### Changelog
 
 #### v0.1.0
