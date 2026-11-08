@@ -22,6 +22,15 @@ Context window truncation (optional, enabled when max_context_tokens > 0):
       state["context_truncated"]          bool  — whether any eviction occurred this episode
       state["context_truncated_at_turn"]  int   — trajectory step index of first eviction
       state["context_evictions"]          int   — total messages evicted across the episode
+
+Training-time probe capture (optional, probe_capture=True; training-probe plan, Phase 1):
+  - get_model_response executes the greedy response and draws m sampled reasoning
+    blocks at the training temperature for the pi_hat estimate (D-4).
+  - add_trajectory_step writes the full conditional matrix, the context-window state
+    and the oracle proposal into extras["probe"] (plan/training-probe/probe-schema.md §1).
+  - oracle="handcoded" runs alfworld's HandCodedTWAgent in-env (D-6); "planner" reads
+    the engine's policy_commands.
+  With probe_capture unset and oracle="off" every path above is byte-identical to before.
 """
 import asyncio
 import contextlib
@@ -62,6 +71,13 @@ FORMAT_REMINDER = (
     "Do NOT use square brackets -- the format must be "
     "<action>command</action>, NOT [action]command[/action]."
 )
+
+# Training-time probe (Phase 1).
+ORACLE_MODES = ("off", "handcoded", "planner")
+PROBE_SCHEMA_VERSION = 1
+# Oracle record when no oracle runs (probe-schema.md §1 "oracle"); copied per turn.
+_ORACLE_OFF: dict[str, Any] = {"action": None, "status": "off", "plan": None, "steps_left": None}
+_ORACLE_FIELDS = tuple(_ORACLE_OFF)
 
 # Per-process cache: game_file -> tw_env_id registered with textworld.gym.
 # Populated lazily on first rollout of each game file; lock only needed on
@@ -204,6 +220,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         use_nm_fusion: bool = True,
         prewarm_pi_hat_prefixes: bool = True,
         use_score_route: bool = True,
+        probe_capture: bool = False,
+        probe_block_temperature: float = 0.8,
+        probe_block_min_p: float = 0.1,
+        oracle: str = "off",
+        store_raw_logps: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -242,6 +263,24 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # construction but never calls _count_tokens, so the tokenizer is never
         # loaded there — saving ~200 MB resident in the orchestrator process.
         self._tokenizer = None
+        # Training-time probe (training-probe plan, Phase 1). probe_capture=True
+        # switches get_model_response to "greedy executed response + m sampled
+        # reasoning blocks at the training temperature" (D-4) and makes
+        # add_trajectory_step write the full pi_hat matrix, the window state and
+        # the oracle proposal into extras["probe"] (probe-schema.md §1). Off by
+        # default; with it unset the training path is byte-identical (D-12).
+        if oracle not in ORACLE_MODES:
+            raise ValueError(f"oracle must be one of {ORACLE_MODES}, got {oracle!r}")
+        if probe_capture and num_reasoning_blocks < 2:
+            raise ValueError(
+                "probe_capture requires num_reasoning_blocks >= 2 (the pi_hat matrix "
+                f"needs sampled blocks); got {num_reasoning_blocks}"
+            )
+        self.probe_capture = probe_capture
+        self.probe_block_temperature = probe_block_temperature
+        self.probe_block_min_p = probe_block_min_p
+        self.oracle = oracle
+        self.store_raw_logps = store_raw_logps
 
     # ------------------------------------------------------------------
     # TextWorld helpers
@@ -253,18 +292,28 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         Registration is done at most once per game file per process (lazy cache).
         The lock is only contended on the first rollout of each game file.
         """
-        if game_file in _TW_ENV_ID_CACHE:
-            return _TW_ENV_ID_CACHE[game_file]
+        # Probe oracle modes request extra EnvInfos (facts for the handcoded
+        # expert, policy_commands for the planner), so they register under their
+        # own cache key. The training path's key and request_infos are unchanged.
+        oracle = getattr(self, "oracle", "off")
+        cache_key = game_file if oracle == "off" else f"{game_file}::oracle={oracle}"
+        if cache_key in _TW_ENV_ID_CACHE:
+            return _TW_ENV_ID_CACHE[cache_key]
 
         with _TW_REGISTER_LOCK:
             # Re-check inside the lock: another thread may have registered while
             # we were waiting.
-            if game_file not in _TW_ENV_ID_CACHE:
+            if cache_key not in _TW_ENV_ID_CACHE:
                 import textworld
                 import textworld.gym
                 from alfworld.agents.environment.alfred_tw_env import AlfredDemangler, AlfredInfos
 
-                request_infos = textworld.EnvInfos(won=True, admissible_commands=True, extras=["gamefile"])
+                info_kwargs: dict[str, Any] = dict(won=True, admissible_commands=True, extras=["gamefile"])
+                if oracle == "handcoded":
+                    info_kwargs["facts"] = True  # BasePolicy.get_facts reads game_state["facts"]
+                elif oracle == "planner":
+                    info_kwargs["policy_commands"] = True  # fast_downward plan per step
+                request_infos = textworld.EnvInfos(**info_kwargs)
                 tw_env_id = textworld.gym.register_games(
                     [game_file],
                     request_infos,
@@ -273,9 +322,9 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                     max_episode_steps=MAX_EPISODE_STEPS,
                     wrappers=[_make_demangler, AlfredInfos],
                 )
-                _TW_ENV_ID_CACHE[game_file] = tw_env_id
+                _TW_ENV_ID_CACHE[cache_key] = tw_env_id
 
-        return _TW_ENV_ID_CACHE[game_file]
+        return _TW_ENV_ID_CACHE[cache_key]
 
     def _make_tw_env(self, game_file: str):
         """Instantiate and return a fresh TextWorld gym env for one game file.
@@ -510,6 +559,12 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # super() must be resolved in method scope (zero-arg super() does not work
         # inside the comprehension below); the bound method is then called m times.
         parent_get_response = super().get_model_response
+        if getattr(self, "probe_capture", False):
+            # Training-time probe (Phase 1, D-4): greedy executed response plus m
+            # sampled blocks for the pi_hat matrix. Never taken on the training path.
+            return await self._probe_get_model_response(
+                state, prompt, parent_get_response, m, *args, **kwargs
+            )
         if m == 1:
             return await parent_get_response(state, prompt, *args, **kwargs)
 
@@ -552,7 +607,9 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         state["_executed_block_idx"] = j_star
         return responses[j_star]
 
-    async def _generate_m_blocks_fused(self, state: vf.State, prompt, m: int):
+    async def _generate_m_blocks_fused(
+        self, state: vf.State, prompt, m: int, sampling_args: dict | None = None
+    ):
         """Generate the m reasoning blocks with a SINGLE n=m request (Phase 8/9).
 
         Mirrors verifiers' Client.get_response but (a) sets sampling n=m so the
@@ -569,7 +626,10 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """
         client = state["client"]
         model = state["model"]
-        sampling_args = {**(state.get("sampling_args") or {}), "n": m}
+        # sampling_args: optional override of the state's args (the probe passes the
+        # block temperature / min_p here); default is today's behavior.
+        base_args = sampling_args if sampling_args is not None else (state.get("sampling_args") or {})
+        sampling_args = {**base_args, "n": m}
         tools = state.get("tool_defs")
 
         # Replicate Client.get_response's plumbing (headers + native conversion),
@@ -608,6 +668,63 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         except Exception:  # noqa: BLE001 -- usage tracking is best-effort
             pass
         return responses
+
+    # ------------------------------------------------------------------
+    # Training-time probe: generation (Phase 1, D-4)
+    # ------------------------------------------------------------------
+
+    def _probe_block_sampling_args(self, state: vf.State, override: dict | None = None) -> dict:
+        """Sampling args for the m probe blocks: the state's args (as the executed
+        response uses them, T=0 under ProbeSamplingConfig) with temperature and
+        extra_body.min_p replaced by the training values, so the pi_hat matrix is
+        estimated under the distribution the trainer actually samples from."""
+        base = dict(override if override is not None else (state.get("sampling_args") or {}))
+        extra = dict(base.get("extra_body") or {})
+        base["temperature"] = float(self.probe_block_temperature)
+        extra["min_p"] = float(self.probe_block_min_p)
+        base["extra_body"] = extra
+        base.pop("n", None)
+        return base
+
+    async def _probe_get_model_response(
+        self, state: vf.State, prompt: vf.Messages, parent_get_response, m: int, *args, **kwargs
+    ):
+        """Probe capture: TWO requests per turn, not one.
+
+        1) The executed response with the state's sampling args (greedy under the
+           probe config, mimicking eval). It is what the engine receives.
+        2) m sampled reasoning blocks at the training temperature / min_p (one n=m
+           request; m separate generations as fallback) for the pi_hat matrix.
+
+        A single n=m+1 request cannot mix temperatures (plan Phase 1 §14). The stash
+        contract matches the training path except ``_executed_block_idx`` is None:
+        no sampled block executed, so _compute_pi_hat / _write_probe_extras use the
+        plain mean over all m blocks instead of leave-one-out.
+        """
+        exec_resp = await parent_get_response(state, prompt, *args, **kwargs)
+
+        block_args = self._probe_block_sampling_args(state, kwargs.get("sampling_args"))
+        blocks = None
+        if getattr(self, "use_nm_fusion", True):
+            try:
+                blocks = await self._generate_m_blocks_fused(state, prompt, m, sampling_args=block_args)
+            except Exception as exc:  # noqa: BLE001 -- never fail the rollout on fusion
+                logger.warning(
+                    f"probe n=m block generation fusion failed ({exc!r}); falling back to "
+                    "m separate generations (slow)."
+                )
+                blocks = None
+        if blocks is None:
+            block_kwargs = {**kwargs, "sampling_args": block_args}
+            blocks = list(
+                await asyncio.gather(
+                    *[parent_get_response(state, prompt, *args, **block_kwargs) for _ in range(m)]
+                )
+            )
+
+        state["_pending_reasoning_blocks"] = list(blocks)
+        state["_executed_block_idx"] = None  # greedy response executed, not a sampled block
+        return exec_resp
 
     async def setup_state(self, state: vf.State) -> vf.State:
         # Defensive: ensure TMPDIR exists before any planner subprocess.
@@ -685,6 +802,8 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         state["num_admissible"] = 0
         state["num_format_compliant"] = 0
         state["_last_admissible_commands"] = infos["admissible_commands"][0]
+        if getattr(self, "oracle", "off") != "off":
+            self._oracle_setup(state, game_file, obs[0], infos)
         initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
         state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
         return state
@@ -703,6 +822,111 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # belt-and-suspenders end-of-rollout pop.
         state.pop("_pending_reasoning_blocks", None)
         state.pop("_executed_block_idx", None)
+        # Training-time probe: the oracle agent is not serializable; the last
+        # proposal was consumed by add_trajectory_step.
+        state.pop("_probe_oracle_agent", None)
+        state.pop("_probe_oracle_last", None)
+
+    # ------------------------------------------------------------------
+    # Training-time probe: oracle (Phase 1, D-6)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _oracle_record(status: str, action: str | None = None, plan: list[str] | None = None) -> dict:
+        return {
+            "action": action,
+            "status": status,
+            "plan": plan,
+            "steps_left": None if plan is None else len(plan),
+        }
+
+    def _oracle_setup(self, state: vf.State, game_file: str, intro_obs: str, infos) -> None:
+        """Instantiate the in-env oracle right after reset(). Never raises.
+
+        oracle="handcoded": alfworld's HandCodedTWAgent, driven directly rather than
+        through the AlfredExpert TextWorld wrapper (which re-raises a timeout into
+        the engine step and silently substitutes random actions; D-6). reset() reads
+        traj_data.json next to the game file; observe(intro) records the room's
+        receptacles. No proposal exists before the first action (status "init").
+        oracle="planner": the engine's policy_commands from the requested EnvInfos.
+        """
+        state["_probe_oracle_agent"] = None
+        state["_probe_oracle_last"] = dict(_ORACLE_OFF)
+        oracle = getattr(self, "oracle", "off")
+        try:
+            if oracle == "handcoded":
+                from alfworld.agents.expert import HandCodedTWAgent
+
+                agent = HandCodedTWAgent(max_steps=200)
+                agent.reset(game_file)
+                agent.observe(intro_obs)
+                state["_probe_oracle_agent"] = agent
+                state["_probe_oracle_last"] = self._oracle_record("init")
+            elif oracle == "planner":
+                state["_probe_oracle_last"] = self._planner_oracle(infos)
+        except Exception as exc:  # noqa: BLE001 -- the oracle must never fail a rollout
+            logger.warning(f"oracle setup ({oracle}) failed for {game_file!r}: {exc!r}")
+            state["_probe_oracle_last"] = self._oracle_record("error")
+
+    def _planner_oracle(self, infos) -> dict:
+        """Oracle record from the engine's policy_commands (oracle="planner")."""
+        try:
+            plan = [str(c) for c in (infos["policy_commands"][0] or [])]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"planner oracle: policy_commands unavailable: {exc!r}")
+            return self._oracle_record("error")
+        return self._oracle_record("planner", action=plan[0] if plan else None, plan=plan)
+
+    def _oracle_after_step(self, state: vf.State, action: str, obs: str, infos) -> dict:
+        """Oracle proposal for the state reached after executing ``action``: what the
+        model should do on its next turn. Called from env_response after tw_env.step."""
+        oracle = getattr(self, "oracle", "off")
+        if oracle == "planner":
+            return self._planner_oracle(infos)
+        agent = state.get("_probe_oracle_agent")
+        if agent is None:
+            return self._oracle_record("error")
+        if "facts" not in infos:
+            # [VERIFY at Phase 5] the gym wrapper exposes EnvInfos.facts under this key.
+            logger.warning("handcoded oracle: 'facts' missing from infos; reporting status=error")
+            return self._oracle_record("error")
+        game_state = {
+            "feedback": obs,
+            "admissible_commands": list(infos["admissible_commands"][0]),
+            "facts": infos["facts"][0],
+            "won": bool(infos["won"][0]) if "won" in infos else False,
+        }
+        return self._oracle_query(agent, game_state, action)
+
+    def _oracle_query(self, agent, game_state: dict, last_action: str) -> dict:
+        """One raw proposal from the handcoded policy plus a status.
+
+        HandCodedAgent.act wraps policy.act with a random substitution (proposal ==
+        last_action, or a "look" that led to an inadmissible proposal -> random
+        admissible action). The probe wants the raw proposal AND whether that
+        substitution would have fired, so policy.act is called exactly once (it
+        advances the policy's internal step) and the two-line check is replicated
+        here. Statuses (probe-schema.md §1): expert | random | look_fallback |
+        failed | timeout | error.
+        """
+        try:
+            raw = agent.policy.act(game_state, last_action)
+        except Exception as exc:  # noqa: BLE001
+            name = type(exc).__name__  # alfworld's two NameError subclasses, by name
+            if name == "HandCodedAgentTimeout":
+                return self._oracle_record("timeout")
+            if name == "HandCodedAgentFailed":
+                return self._oracle_record("failed")
+            logger.warning(f"handcoded oracle raised {exc!r}; reporting status=error")
+            return self._oracle_record("error")
+        admissible = game_state.get("admissible_commands") or []
+        if raw == last_action or (last_action == "look" and raw not in admissible):
+            status = "random"  # HandCodedAgent.act would substitute a random action
+        elif raw not in admissible:
+            status = "look_fallback"  # AlfredExpert would keep its default ["look"] plan
+        else:
+            status = "expert"
+        return self._oracle_record(status, action=raw)
 
     def _parse_action(self, messages: vf.Messages) -> str:
         """Extract action text from the last AssistantMessage.
@@ -722,14 +946,30 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 content = msg.content or ""
                 if not isinstance(content, str):
                     content = str(content)
-                # Primary: parse <action>...</action> tag
-                match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
-                if match:
-                    return match.group(1).strip()
-                # Fallback: strip <think> block and use the rest
-                text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                return text if text else content.strip()
+                return self._parse_action_text(content)
         return "look"  # safe no-op if no model message found
+
+    @staticmethod
+    def _parse_action_text(content: str) -> str:
+        """Action text from one assistant completion string: the per-message core of
+        _parse_action, also applied to each sampled probe block (what that block
+        *would* have executed). Same fallbacks, so a* matches the engine input."""
+        # Primary: parse <action>...</action> tag
+        match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Fallback: strip <think> block and use the rest
+        text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        return text if text else content.strip()
+
+    @staticmethod
+    def _completion_text(messages) -> str:
+        """Content of the last assistant message in ``messages`` ("" if none)."""
+        for msg in reversed(messages or []):
+            if isinstance(msg, vf.AssistantMessage):
+                content = msg.content or ""
+                return content if isinstance(content, str) else str(content)
+        return ""
 
     async def add_trajectory_step(self, state: vf.State, trajectory_step: vf.TrajectoryStep) -> None:
         """Action-level ARM (Phase 1): record this turn's admissible set + executed action.
@@ -767,7 +1007,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # decision point degrades to "no pi_hat" rather than killing the rollout.
         blocks = state.get("_pending_reasoning_blocks")
         j_star = state.get("_executed_block_idx")
-        if (
+        if getattr(self, "probe_capture", False):
+            # Training-time probe (Phase 1): full matrix + window + oracle into
+            # extras["probe"]; extras["pi_hat"] = plain-mean marginal at a*.
+            await self._write_probe_extras(state, trajectory_step, extras, admissible, a_star, blocks)
+        elif (
             self.num_reasoning_blocks > 1
             and blocks is not None
             and j_star is not None
@@ -812,43 +1056,50 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         cpl = self._common_prefix_len(base, full)
         return full[cpl:]
 
-    async def _compute_pi_hat(
+    @staticmethod
+    def _admissible_union(admissible: list[str], a_star: str) -> tuple[list[str], int]:
+        """Union invariant: a* is among the scored candidates (appended at the end if
+        absent). Mirrors prime_rl.orchestrator.admissible.substitute_executed_into_admissible
+        (replicated here because verifiers does not depend on prime_rl; a test pins the
+        two orders equal) -- the index space of every per-action vector downstream."""
+        candidates = list(admissible)
+        if a_star in candidates:
+            return candidates, candidates.index(a_star)
+        candidates.append(a_star)
+        return candidates, len(candidates) - 1
+
+    async def _score_pi_hat_matrix(
         self,
         state: vf.State,
         blocks: list,
-        j_star: int,
         admissible: list[str],
         a_star: str,
-    ) -> float:
-        """RBMC leave-one-out estimate of pi_hat(a*|o) from the m reasoning blocks.
+    ):
+        """Teacher-force-score every admissible action against every reasoning block.
 
-        For each block R_j: build [o, R_j, <action>a</action>] for every admissible
-        action a (re-encoding reasoning+action together so the </think>-><action>
-        BPE seam is handled, and scoring from the first divergent token so every
-        candidate shares the same conditioning prefix -- the shared seam token
-        cancels in the softmax). Teacher-force-score the batch (one /v1/completions
-        request), renormalize over A(o) to get pi(·|o, R_j), keep the conditional at
-        a*. Average across blocks leaving out the executed block j*
-        (rbmc_marginal_loo). Scored at T=1 / neutral so pi_hat is the raw marginal.
+        For each block R_j: build [o, R_j, <action>a</action>] for every candidate a
+        (re-encoding reasoning+action together so the </think>-><action> BPE seam is
+        handled, and scoring from the first divergent token so every candidate shares
+        the same conditioning prefix -- the shared seam token cancels in the softmax).
+        Score the whole m x |A| batch in one request, renormalize each block's row
+        over the candidates to get pi(·|o, R_j). Scored at T=1 / neutral so the
+        conditionals are the raw policy.
+
+        Returns a PiHatMatrix (rbmc.py): candidates (admissible union), a_star_idx,
+        cond[m][|A|], Z[m] (per-block log-sum-exp renormalizer), raw[m][|A|]. The
+        training path reduces it to the leave-one-out scalar at a* (_compute_pi_hat);
+        the probe capture path records all of it (_write_probe_extras).
         """
         # rbmc ships alongside this module (pyproject include). Dual import covers
         # both the installed top-level layout and the in-repo package layout.
         try:
-            from rbmc import conditional_renorm, rbmc_marginal_loo
+            from rbmc import PiHatMatrix, conditional_renorm, logsumexp
         except ImportError:
-            from environments.alfworld.rbmc import conditional_renorm, rbmc_marginal_loo
+            from environments.alfworld.rbmc import PiHatMatrix, conditional_renorm, logsumexp
 
         self._ensure_tokenizer(state)
 
-        # Union invariant: a* must be among the scored candidates (the canonical
-        # helper is prime_rl.orchestrator.admissible.substitute_executed_into_admissible;
-        # replicated inline here because verifiers does not depend on prime_rl).
-        candidates = list(admissible)
-        if a_star in candidates:
-            a_star_idx = candidates.index(a_star)
-        else:
-            candidates.append(a_star)
-            a_star_idx = len(candidates) - 1
+        candidates, a_star_idx = self._admissible_union(admissible, a_star)
 
         client = state["client"]
         model = state["model"]
@@ -907,12 +1158,121 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # prefix-cache hits on [o, R_j]).
         logps = await self._score_continuations(client, all_prompts, all_spans, model)
 
-        conditionals_at_astar: list[float] = []
+        cond: list[list[float]] = []
+        Z: list[float] = []
+        raw: list[list[float]] = []
         for start, end in block_slices:
-            cond = conditional_renorm(logps[start:end])
-            conditionals_at_astar.append(cond[a_star_idx])
+            row = list(logps[start:end])
+            raw.append(row)
+            cond.append(conditional_renorm(row))
+            Z.append(logsumexp(row))
+        return PiHatMatrix(candidates=candidates, a_star_idx=a_star_idx, cond=cond, Z=Z, raw=raw)
 
+    async def _compute_pi_hat(
+        self,
+        state: vf.State,
+        blocks: list,
+        j_star: int | None,
+        admissible: list[str],
+        a_star: str,
+    ) -> float:
+        """RBMC estimate of pi_hat(a*|o) from the m reasoning blocks.
+
+        Training path: j_star is the block that generated a*; average the
+        conditionals at a* across blocks leaving it out (rbmc_marginal_loo, the
+        hold-out structure of RLOO). Probe capture: j_star is None (the executed
+        response was a separate greedy generation, no sampled block produced a*), so
+        the plain mean over all m blocks is the right estimate (rbmc_marginal).
+        """
+        try:
+            from rbmc import rbmc_marginal, rbmc_marginal_loo
+        except ImportError:
+            from environments.alfworld.rbmc import rbmc_marginal, rbmc_marginal_loo
+
+        mat = await self._score_pi_hat_matrix(state, blocks, admissible, a_star)
+        conditionals_at_astar = [row[mat.a_star_idx] for row in mat.cond]
+        if j_star is None:
+            return rbmc_marginal(conditionals_at_astar)
         return rbmc_marginal_loo(conditionals_at_astar, exclude_idx=j_star)
+
+    async def _write_probe_extras(
+        self,
+        state: vf.State,
+        trajectory_step,
+        extras: dict,
+        admissible: list[str],
+        a_star: str,
+        blocks: list | None,
+    ) -> None:
+        """Training-time probe capture: write extras["probe"] (probe-schema.md §1) and
+        extras["pi_hat"] (plain-mean marginal at a*). Never raises. On a scoring
+        failure the record is still written with blocks=[] / pi_hat_marginal=None /
+        Z=[] and extras["pi_hat"] left unset, mirroring the training path's degrade
+        (the server then zeroes adv_star for the turn)."""
+        completion_text = self._completion_text(trajectory_step.get("completion") or [])
+        step_idx = len(state.get("trajectory") or [])  # this turn's index; step appended after
+        candidates, a_star_idx = self._admissible_union(admissible, a_star)
+
+        prompt_msgs = trajectory_step.get("prompt") or []
+        window: dict[str, Any] = {
+            "labels": [],
+            "token_count": None,
+            "evictions_so_far": int(state.get("context_evictions", 0) or 0),
+        }
+        try:
+            window["labels"] = self._label_prompt(prompt_msgs, step_idx)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"probe window labels failed: {exc!r}")
+        try:
+            window["token_count"] = int(await self._count_tokens(prompt_msgs, state))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"probe window token count failed: {exc!r}")
+
+        oracle = state.get("_probe_oracle_last") or _ORACLE_OFF
+        probe: dict[str, Any] = {
+            "schema": PROBE_SCHEMA_VERSION,
+            "admissible_union": candidates,
+            "executed_idx": a_star_idx,
+            "parsed_ok": re.search(r"<action>.*?</action>", completion_text, re.DOTALL) is not None,
+            "exec_block": {
+                "reasoning": completion_text.split("<action>")[0],
+                "action": a_star,
+                "completion": completion_text,
+            },
+            "blocks": [],
+            "pi_hat_marginal": None,
+            "Z": [],
+            "raw_logps": None,
+            "window": window,
+            "oracle": {k: oracle.get(k) for k in _ORACLE_FIELDS},
+        }
+
+        if blocks and state.get("error") is None:
+            try:
+                mat = await self._score_pi_hat_matrix(state, blocks, admissible, a_star)
+                if mat.candidates != candidates:  # same construction; guard the invariant
+                    raise RuntimeError("admissible union mismatch between record and matrix")
+                marginal = mat.marginal()
+                rows = []
+                for j, block in enumerate(blocks):
+                    content = block.message.content or ""
+                    rows.append(
+                        {
+                            "reasoning": content.split("<action>")[0],
+                            "action": self._parse_action_text(content),
+                            "cond": mat.cond[j],
+                        }
+                    )
+                probe["blocks"] = rows
+                probe["pi_hat_marginal"] = marginal
+                probe["Z"] = mat.Z
+                if getattr(self, "store_raw_logps", False):
+                    probe["raw_logps"] = mat.raw
+                extras["pi_hat"] = marginal[mat.a_star_idx]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"probe pi_hat matrix failed; writing degraded record: {exc!r}")
+
+        extras["probe"] = probe
 
     async def _prewarm_prefixes(self, client, prefix_token_ids: list[list[int]], model: str) -> None:
         """Prefill the [o, R_j] prefixes (one per reasoning block) so the subsequent
@@ -1151,6 +1511,10 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 f"took={_dt_step:.2f}s action={action!r}"
             )
         state["_last_admissible_commands"] = infos["admissible_commands"][0]
+        if getattr(self, "oracle", "off") != "off":
+            # Training-time probe: the oracle's proposal for the state the model
+            # acts on next turn (consumed by add_trajectory_step, probe capture).
+            state["_probe_oracle_last"] = self._oracle_after_step(state, action, obs[0], infos)
 
         content = self._format_obs(obs[0], infos["admissible_commands"][0])
         response = vf.UserMessage(content=content)
@@ -1262,11 +1626,54 @@ def _curriculum_weights_for_task_type(
     return weights
 
 
+def _build_probe_dataset(
+    data_path: str,
+    probe_games: list[dict],
+    curriculum: list | None = None,
+    task_types: list[str] | None = None,
+) -> Dataset:
+    """Rows for exactly the probe set's games, in list order (training-probe D-5).
+
+    Each ``info`` carries ``game_file`` (resolved under data_path; existence is
+    checked at setup_state, as for scanned rows) plus the probe-set identity the
+    orchestrator writes into every record: ``game_id``, ``probe_id``, ``split``,
+    ``task_type``, ``role``. The probe set fixes the list, so curriculum /
+    task_types are ignored (with a warning) when given.
+    """
+    try:
+        from probe_sets import resolve_game_file
+    except ImportError:
+        from environments.alfworld.probe_sets import resolve_game_file
+
+    if not probe_games:
+        raise ValueError("probe_games is empty")
+    if curriculum is not None or task_types is not None:
+        logger.warning("probe_games given: curriculum / task_types are ignored (the probe set fixes the game list)")
+    rows = []
+    for g in probe_games:
+        rows.append(
+            {
+                "prompt": [{"role": "system", "content": SYSTEM_PROMPT}],
+                "answer": "",
+                "info": {
+                    "game_file": resolve_game_file(data_path, g["game_id"]),
+                    "game_id": g["game_id"],
+                    "probe_id": g["probe_id"],
+                    "split": g["split"],
+                    "task_type": g["task_type"],
+                    "role": g["role"],
+                },
+            }
+        )
+    return Dataset.from_list(rows)
+
+
 def build_dataset(
     data_path: str,
     split: str,
     curriculum: list | None = None,
     task_types: list[str] | None = None,
+    probe_games: list[dict] | None = None,
 ) -> Dataset:
     """Scan game files under data_path/split and return a HuggingFace Dataset.
 
@@ -1284,7 +1691,13 @@ def build_dataset(
     Returns:
         HuggingFace Dataset with rows containing prompt, answer, info, and
         (if curriculum is set) curriculum_weights.
+        probe_games: Training-time probe. When given (the loaded probe-set game
+            list), build rows for exactly those games in order instead of
+            scanning ``split``; see _build_probe_dataset.
     """
+    if probe_games is not None:
+        return _build_probe_dataset(data_path, probe_games, curriculum=curriculum, task_types=task_types)
+
     split_map = {
         "train": "train",
         "valid_seen": "valid_seen",
@@ -1357,6 +1770,12 @@ def load_environment(
     use_nm_fusion: bool = True,
     prewarm_pi_hat_prefixes: bool = True,
     use_score_route: bool = True,
+    probe_set: str | None = None,
+    probe_capture: bool = False,
+    probe_block_temperature: float = 0.8,
+    probe_block_min_p: float = 0.1,
+    oracle: str = "off",
+    store_raw_logps: bool = False,
 ) -> vf.Environment:
     """
     Args:
@@ -1367,6 +1786,17 @@ def load_environment(
             and AutoTokenizer.from_pretrained on that name fails. Set this to
             the base model path (e.g. "/workspace/sft-checkpoint" or
             "Qwen/Qwen2.5-1.5B-Instruct"). Tokenization is LoRA-invariant.
+        probe_set: Training-time probe (plan/training-probe). Name of a probe set
+            shipped in probe_sets/ (e.g. "alfworld-24-v1"); the dataset is then
+            exactly those games, in order, and ``split`` is not scanned.
+        probe_capture: Greedy executed response + m sampled blocks per turn and
+            extras["probe"] per step (probe-schema.md §1). Requires
+            num_reasoning_blocks >= 2. Off on the training path.
+        probe_block_temperature / probe_block_min_p: sampling for the m probe
+            blocks (the training values, 0.8 / 0.1 by default).
+        oracle: "off" | "handcoded" (alfworld HandCodedTWAgent in-env) | "planner"
+            (engine policy_commands; slow, fast_downward per step).
+        store_raw_logps: keep the raw m x |A| span logprobs in the probe record.
     """
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
@@ -1375,8 +1805,18 @@ def load_environment(
     rubric.add_reward_func(admissible_action_rate, weight=0.0)
     rubric.add_reward_func(format_compliance_rate, weight=0.0)
 
+    probe_games = None
+    if probe_set is not None:
+        try:
+            from probe_sets import load_probe_set
+        except ImportError:
+            from environments.alfworld.probe_sets import load_probe_set
+        probe_games = load_probe_set(probe_set)
+
     env = ALFWorldEnvironment(
-        dataset=lambda: build_dataset(data_path, split, curriculum=curriculum, task_types=task_types),
+        dataset=lambda: build_dataset(
+            data_path, split, curriculum=curriculum, task_types=task_types, probe_games=probe_games
+        ),
         rubric=rubric,
         max_turns=max_turns,
         max_context_tokens=max_context_tokens,
@@ -1386,6 +1826,11 @@ def load_environment(
         use_nm_fusion=use_nm_fusion,
         prewarm_pi_hat_prefixes=prewarm_pi_hat_prefixes,
         use_score_route=use_score_route,
+        probe_capture=probe_capture,
+        probe_block_temperature=probe_block_temperature,
+        probe_block_min_p=probe_block_min_p,
+        oracle=oracle,
+        store_raw_logps=store_raw_logps,
         env_id="alfworld-env",
     )
     return env

@@ -14,6 +14,7 @@ add_trajectory_step in Phase 4. Diary §6 is the source of truth for the math.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 
 def conditional_renorm(action_logprobs: list[float]) -> list[float]:
@@ -59,3 +60,47 @@ def rbmc_marginal_loo(conditionals_per_block: list[float], exclude_idx: int) -> 
         raise IndexError(f"exclude_idx {exclude_idx} out of range for m={m}")
     held_out_sum = sum(conditionals_per_block) - conditionals_per_block[exclude_idx]
     return held_out_sum / (m - 1)
+
+
+def logsumexp(values: list[float]) -> float:
+    """log Σ_a exp(values[a]), max-shifted for stability.
+
+    The per-block renormalizer Z_j of the teacher-forced conditional: with
+    values = the summed action-token logprobs over A(o) for block R_j,
+    conditional_renorm(values)[a] == exp(values[a] - logsumexp(values)).
+    Recorded per block in the training-time probe (probe-schema.md §1 "Z").
+    """
+    if not values:
+        raise ValueError("values must be non-empty")
+    m = max(values)
+    return m + math.log(sum(math.exp(v - m) for v in values))
+
+
+@dataclass
+class PiHatMatrix:
+    """Full teacher-forced conditional matrix for one decision point.
+
+    candidates: the admissible union (env's raw admissible set with a* appended
+        if absent) -- the index space of every per-action vector.
+    a_star_idx: index of the executed action in ``candidates``.
+    cond[j][a]: π(a | o, R_j) renormalized over ``candidates`` (row sums to 1).
+    Z[j]: logsumexp of block j's raw summed span logprobs.
+    raw[j][a]: the raw summed span logprobs before renormalization.
+
+    Produced by ALFWorldEnvironment._score_pi_hat_matrix; the training path
+    reduces it to the leave-one-out scalar at a* (_compute_pi_hat), the probe
+    capture path keeps all of it (extras["probe"]).
+    """
+
+    candidates: list[str]
+    a_star_idx: int
+    cond: list[list[float]]
+    Z: list[float]
+    raw: list[list[float]]
+
+    def marginal(self) -> list[float]:
+        """Plain RBMC marginal per action: column mean of ``cond`` over blocks."""
+        m = len(self.cond)
+        if m == 0:
+            raise ValueError("PiHatMatrix has no blocks")
+        return [sum(row[a] for row in self.cond) / m for a in range(len(self.candidates))]
