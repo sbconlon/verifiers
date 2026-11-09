@@ -848,3 +848,63 @@ def test_variants_without_exhaustive_stop_at_the_first_strong_attempt():
     assert syn.attempts == 2 and syn.source == "elicited"
     assert [e.get("variant") for e in syn.attempt_log] == [None, 0, 1]
     assert syn.attempt_log[-1]["accepted"] == "strong"
+
+
+# ---------------------------------------------------------------------------
+# prefill templates: "<instruction><<prefill>><assistant prefix>"
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_only_template_continues_the_assistant_turn():
+    env = _env()
+    client = _StrictClient([[" because it may be there.</think>\n<action>examine shelf 1</action>"]])
+    args = dict(BLOCK_ARGS)
+    text = asyncio.run(env.elicit_block(client, "m", WIRE_PROMPT, SHELF, args,
+                                        template="<<prefill>><think>I will now {action}"))
+    assert text == "<think>I will now examine shelf 1 because it may be there.</think>\n<action>examine shelf 1</action>"
+    sent = client.calls[0]["prompt"]
+    # no instruction: natural prompt + the prefilled assistant turn
+    assert sent[:2] == PROMPT and len(sent) == 3
+    assert sent[2].role == "assistant" and sent[2].content == "<think>I will now examine shelf 1"
+    sa = client.calls[0]["sampling_args"]
+    assert sa["extra_body"] == {"min_p": 0.1, "continue_final_message": True, "add_generation_prompt": False}
+    assert sa["n"] == 1 and sa["temperature"] == 0.8
+    # the caller's args are not mutated
+    assert args == BLOCK_ARGS and BLOCK_ARGS["extra_body"] == {"min_p": 0.1}
+
+
+def test_instruction_plus_prefill_template():
+    env = _env()
+    client = _StrictClient([["...</think>\n<action>examine shelf 1</action>"]])
+    text = asyncio.run(env.elicit_block(client, "m", PROMPT, SHELF, BLOCK_ARGS,
+                                        template="Do {action}.<<prefill>><think>Next: {action}"))
+    assert text.startswith("<think>Next: examine shelf 1...")
+    sent = client.calls[0]["prompt"]
+    assert sent[2].role == "user" and sent[2].content == "Do examine shelf 1."
+    assert sent[3].role == "assistant" and sent[3].content == "<think>Next: examine shelf 1"
+
+
+def test_plain_template_sends_no_continue_flags():
+    env = _env()
+    client = _StrictClient([["<think>x</think>\n<action>examine shelf 1</action>"]])
+    asyncio.run(env.elicit_block(client, "m", PROMPT, SHELF, BLOCK_ARGS))
+    sa = client.calls[0]["sampling_args"]
+    assert sa["extra_body"] == {"min_p": 0.1}
+    assert client.calls[0]["prompt"][-1].role == "user"
+
+
+def test_prefill_variant_cycles_through_synthesize_block():
+    env = _env(theta=0.0, n_elicit=2, elicit_variants=["<<prefill>><think>I will now {action}"])
+    node, client, seen = _node(env)
+    client.scripts = [
+        ["<think>e1</think>\n<action>examine shelf 1</action>"],
+        [" since the shelf is unexplored.</think>\n<action>examine shelf 1</action>"],
+    ]
+    env._score_continuations = _scorer([list(ELICITED_ROWS[2]), list(ELICITED_ROWS[1])], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.attempts == 2 and syn.source == "elicited"
+    # the prefilled attempt (variant 1) had the higher p and is the weak pick
+    assert syn.reasoning == "<think>I will now examine shelf 1 since the shelf is unexplored.</think>\n"
+    assert syn.attempt_log[2]["variant"] == 1 and syn.attempt_log[2]["accepted"] == "weak"
+    # the scored reasoning is prefill + continuation, under the natural prompt ids
+    assert seen[-1]["prompts"][0][:3] == node.o_ids

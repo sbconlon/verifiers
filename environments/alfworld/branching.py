@@ -21,6 +21,12 @@ ELICIT_DEFAULT = (
     "step in your usual format and end with exactly that action."
 )
 
+# Elicitation template marker: "<instruction><<prefill>><assistant prefix>".
+# The part before it is appended as a user message (empty = no instruction);
+# the part after it is prefilled as the start of the assistant turn and the
+# model continues it (vLLM continue_final_message). Both take {action}.
+PREFILL_MARK = "<<prefill>>"
+
 # Case-insensitive regexes; an elicited block matching any is rejected ("leak").
 LEAK_DEFAULT = [
     r"\bdecided\b",

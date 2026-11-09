@@ -65,6 +65,7 @@ try:
     from branching import (
         ELICIT_DEFAULT,
         LEAK_DEFAULT,
+        PREFILL_MARK,
         Block,
         NodeScore,
         Synthesis,
@@ -81,6 +82,7 @@ except ImportError:
     from environments.alfworld.branching import (
         ELICIT_DEFAULT,
         LEAK_DEFAULT,
+        PREFILL_MARK,
         Block,
         NodeScore,
         Synthesis,
@@ -1036,14 +1038,27 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         self, client, model: str, prompt_messages, action: str, sampling_args: dict,
         template: str | None = None,
     ) -> str:
-        """One completion under ``prompt_messages + [user(instruction)]`` (D-4),
-        the instruction being ``template`` (default: elicit_prompt) with {action}
-        substituted. Returns the raw completion text; the instruction is never stored."""
+        """One elicited completion for ``action`` (D-4). ``template`` (default:
+        elicit_prompt) takes {action}. Its text before PREFILL_MARK is appended
+        as a user instruction (empty = none); its text after the mark is
+        prefilled as the start of the assistant turn and the model continues it
+        (vLLM ``continue_final_message``; the returned text is prefill +
+        continuation). Without the mark the whole template is the instruction.
+        The instruction is never stored."""
         nstate = self._node_state(client, model, sampling_args)
-        instruction = vf.UserMessage(content=(template or self.elicit_prompt).format(action=action))
-        prompt = self._messages_from_raw(prompt_messages) + [instruction]
-        resp = (await self._generate_node_responses(nstate, prompt, 1, sampling_args))[0]
-        return resp.message.content or ""
+        instruction, _, prefill = (template or self.elicit_prompt).partition(PREFILL_MARK)
+        prompt = self._messages_from_raw(prompt_messages)
+        if instruction.strip():
+            prompt.append(vf.UserMessage(content=instruction.format(action=action)))
+        args = dict(sampling_args or {})
+        if prefill:
+            prefill = prefill.format(action=action)
+            prompt.append(vf.AssistantMessage(content=prefill))
+            extra = dict(args.get("extra_body") or {})
+            extra.update(continue_final_message=True, add_generation_prompt=False)
+            args["extra_body"] = extra
+        resp = (await self._generate_node_responses(nstate, prompt, 1, args))[0]
+        return prefill + (resp.message.content or "")
 
     async def synthesize_block(
         self,
