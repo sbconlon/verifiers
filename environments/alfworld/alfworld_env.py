@@ -31,16 +31,25 @@ Training-time probe capture (optional, probe_capture=True; training-probe plan, 
   - oracle="handcoded" runs alfworld's HandCodedTWAgent in-env (D-6); "planner" reads
     the engine's policy_commands.
   With probe_capture unset and oracle="off" every path above is byte-identical to before.
+
+Branched dataset (optional, branch_mode=True; plan/branched-dataset, Phase 1):
+  - score_node / synthesize_block / build_forced_step are called by prime-rl's
+    branch-collect driver outside any rollout (explicit client / model / prompt).
+  - A rollout whose info carries a `branch_seed` starts from a replayed engine
+    state with one forced assistant turn installed (D-11..D-13); max_turns is
+    offset by the turns the seed consumed. Without a seed nothing changes.
 """
 import asyncio
 import contextlib
 import datetime
 import logging
+import math
 import os
 import random
 import re
 import threading
 import time
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -48,6 +57,40 @@ from typing import Any, Optional
 import verifiers as vf
 from datasets import Dataset
 from openai import BaseModel
+
+# Branched dataset helpers (plan/branched-dataset, Phase 1). branching.py ships
+# beside this module (pyproject include); the second form covers the in-repo
+# package layout, as for rbmc / probe_sets.
+try:
+    from branching import (
+        ELICIT_DEFAULT,
+        LEAK_DEFAULT,
+        Block,
+        NodeScore,
+        Synthesis,
+        congruent,
+        format_forced_completion,
+        lead_actions,
+        leaks,
+        ranked_distinct,
+        reject_reason,
+        strip_to_reasoning,
+    )
+except ImportError:
+    from environments.alfworld.branching import (
+        ELICIT_DEFAULT,
+        LEAK_DEFAULT,
+        Block,
+        NodeScore,
+        Synthesis,
+        congruent,
+        format_forced_completion,
+        lead_actions,
+        leaks,
+        ranked_distinct,
+        reject_reason,
+        strip_to_reasoning,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +269,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         oracle: str = "off",
         store_raw_logps: bool = False,
         pi_hat_renorm: bool = True,
+        branch_mode: bool = False,
+        tau: float = 0.5,
+        n_elicit: int = 3,
+        elicit_prompt: str | None = None,
+        leak_patterns: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -290,6 +338,15 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # admissible mass exp(Z_j) <= 1 is left in the record for inspection.
         # Applies to BOTH the training path (_compute_pi_hat) and probe capture.
         self.pi_hat_renorm = pi_hat_renorm
+        # Branched dataset (plan/branched-dataset, Phase 1). branch_mode enables the
+        # seeded setup_state entry (info["branch_seed"]); the node primitives are
+        # explicit method calls. tau / n_elicit / elicit_prompt / leak_patterns
+        # parameterize synthesize_block (D-4). Off by default: byte-identical.
+        self.branch_mode = branch_mode
+        self.tau = float(tau)
+        self.n_elicit = int(n_elicit)
+        self.elicit_prompt = elicit_prompt if elicit_prompt is not None else ELICIT_DEFAULT
+        self.leak_patterns = list(leak_patterns) if leak_patterns is not None else list(LEAK_DEFAULT)
 
     # ------------------------------------------------------------------
     # TextWorld helpers
@@ -747,8 +804,371 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         import tempfile as _tempfile
         os.makedirs(_tempfile.gettempdir(), exist_ok=True)
 
+        # Branched dataset: a rollout seeded at a trunk's decision point (Phase 1).
+        seed = (state.get("info") or {}).get("branch_seed")
+        if seed is not None:
+            return await self._setup_state_from_seed(state, seed)
+
         game_file = state["info"]["game_file"]
         logger.debug(f"setup_state: loading {game_file}")
+        tw_env, obs, infos = await self._reset_engine(game_file)
+
+        state["alf_env"] = tw_env
+        state["won"] = False
+        # Truncation metrics — initialised here so they are always present in
+        # state even for episodes where truncation never fires.
+        state["context_truncated"] = False
+        state["context_truncated_at_turn"] = None
+        state["context_evictions"] = 0
+        state["num_admissible"] = 0
+        state["num_format_compliant"] = 0
+        state["_last_admissible_commands"] = infos["admissible_commands"][0]
+        if getattr(self, "oracle", "off") != "off":
+            self._oracle_setup(state, game_file, obs[0], infos)
+        initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
+        state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
+        return state
+
+    @vf.cleanup
+    async def cleanup_alf_env(self, state: vf.State):
+        tw_env = state.pop("alf_env", None)
+        if tw_env is not None:
+            try:
+                tw_env.close()
+            except Exception:
+                pass
+        # Action-level ARM (Phase 3): drop the transient m-block stash so it never
+        # serializes into the RolloutOutput (it carries raw Response objects and is
+        # consumed same-turn in Phase 4). Overwritten each turn; this is the
+        # belt-and-suspenders end-of-rollout pop.
+        state.pop("_pending_reasoning_blocks", None)
+        state.pop("_executed_block_idx", None)
+        # Training-time probe: the oracle agent is not serializable; the last
+        # proposal was consumed by add_trajectory_step.
+        state.pop("_probe_oracle_agent", None)
+        state.pop("_probe_oracle_last", None)
+
+    # ------------------------------------------------------------------
+    # Branched dataset (plan/branched-dataset, Phase 1)
+    # ------------------------------------------------------------------
+
+    def _resolve_node_client(self, client):
+        """Accept a live verifiers Client or a ClientConfig (what prime-rl's
+        inference pool hands out). A config is resolved the way init_state does
+        (verifiers.clients.resolve_client) and cached per config on this env, since
+        resolve_client builds a fresh HTTP client every call. Anything else (the
+        unit tests' scripted clients) passes through."""
+        try:
+            from verifiers.clients import Client, resolve_client
+        except Exception:  # noqa: BLE001 -- verifiers stubbed (unit tests)
+            return client
+        if isinstance(client, Client):
+            return client
+        dump = getattr(client, "model_dump_json", None)
+        if dump is None:
+            return client
+        cache = getattr(self, "_node_clients", None)
+        if cache is None:
+            cache = self._node_clients = {}
+        key = dump()
+        if key not in cache:
+            cache[key] = resolve_client(client)
+        return cache[key]
+
+    def _node_state(self, client, model: str, sampling_args: dict | None) -> dict:
+        """A minimal State-like dict for the node primitives, which the collect
+        driver calls outside any rollout. The generation and scoring helpers read
+        client / model / sampling_args / tool_defs (and write usage) on it.
+        ``client`` may be a Client or a ClientConfig (_resolve_node_client)."""
+        return {
+            "client": self._resolve_node_client(client),
+            "model": model,
+            "sampling_args": dict(sampling_args or {}),
+            "tool_defs": None,
+            "trajectory": [],
+            "trajectory_id": "node",
+            "info": {},
+        }
+
+    @staticmethod
+    def _messages_from_raw(items) -> list:
+        """Wire-form (role/content dicts) or message objects -> vf messages."""
+        out = []
+        for item in items or []:
+            if hasattr(item, "role") and hasattr(item, "content"):
+                out.append(item)
+                continue
+            d = dict(item)
+            role = d.get("role", "user")
+            content = d.get("content") or ""
+            if role == "assistant":
+                out.append(vf.AssistantMessage(content=content))
+            elif role == "system":
+                out.append(vf.SystemMessage(content=content))
+            else:
+                out.append(vf.UserMessage(content=content))
+        return out
+
+    async def _generate_node_responses(self, nstate: dict, prompt, n: int, sampling_args: dict):
+        """n responses to ``prompt``: one fused n=n request (vLLM prefills o once),
+        falling back to n separate generations when the server does not honor n.
+        Same two paths as get_model_response / _probe_get_model_response."""
+        args = dict(sampling_args or {})
+        args.pop("n", None)
+        responses = None
+        if getattr(self, "use_nm_fusion", True):
+            try:
+                responses = await self._generate_m_blocks_fused(nstate, prompt, n, sampling_args=args)
+            except Exception as exc:  # noqa: BLE001 -- never fail the node on fusion
+                logger.warning(
+                    f"node generation fusion failed ({exc!r}); falling back to {n} separate generations."
+                )
+                responses = None
+        if responses is None:
+            parent = super().get_model_response
+            responses = list(
+                await asyncio.gather(*[parent(nstate, prompt, sampling_args=args) for _ in range(n)])
+            )
+        return responses
+
+    async def score_node(
+        self,
+        client,
+        model: str,
+        prompt_messages,
+        admissible: list[str],
+        m: int,
+        block_sampling_args: dict,
+        greedy_sampling_args: dict | None = None,
+    ) -> NodeScore:
+        """Blocks and rows at a node (branch-schema.md §1; D-5, D-7).
+
+        ``client`` is a verifiers Client or a ClientConfig (resolved + cached).
+        Block 0 is the greedy response (``greedy_sampling_args``, default: the block
+        args at temperature 0); blocks 1..m are sampled with ``block_sampling_args``
+        (the training temperature / min_p). Every block's reasoning is
+        teacher-force-scored against every admissible action under the NATURAL
+        prompt and the row is normalized over ``admissible`` regardless of
+        pi_hat_renorm (acceptance asks "which admissible action would the policy
+        pick", D-5). A block leads to its row argmax (D-7); ``own`` ranks the
+        distinct led-to actions by how many blocks lead to them.
+        """
+        if not admissible:
+            raise ValueError("score_node: empty admissible set")
+        if m < 1:
+            raise ValueError("score_node: m must be >= 1")
+        nstate = self._node_state(client, model, block_sampling_args)
+        if greedy_sampling_args is None:
+            greedy_sampling_args = {**dict(block_sampling_args or {}), "temperature": 0.0}
+        greedy = await self._generate_node_responses(nstate, prompt_messages, 1, greedy_sampling_args)
+        sampled = await self._generate_node_responses(nstate, prompt_messages, m, block_sampling_args)
+        responses = list(greedy[:1]) + list(sampled)
+
+        self._ensure_tokenizer(nstate)
+        # a_star = admissible[0] keeps the union invariant a no-op: the candidate
+        # index space is exactly `admissible`.
+        mat = await self._score_pi_hat_matrix(nstate, responses, admissible, admissible[0], renorm=True)
+        rows = [list(r) for r in mat.cond]
+        masses = [math.exp(z) for z in mat.Z]
+        lead_idx = lead_actions(rows)
+
+        blocks: list[Block] = []
+        texts: list[str] = []
+        for resp in responses:
+            content = resp.message.content or ""
+            reasoning = strip_to_reasoning(content)
+            blocks.append(
+                Block(
+                    reasoning=reasoning,
+                    tag_action=self._parse_action_text(content),
+                    completion_text=content,
+                )
+            )
+            texts.append(reasoning)
+        o_ids = list(responses[0].message.tokens.prompt_ids)
+        return NodeScore(
+            blocks=blocks,
+            rows=rows,
+            masses=masses,
+            lead=[admissible[i] for i in lead_idx],
+            own=ranked_distinct(lead_idx, admissible),
+            texts=texts,
+            admissible=list(admissible),
+            o_ids=o_ids,
+        )
+
+    async def _score_row(self, nstate: dict, o_ids: list[int], reasoning: str, admissible: list[str]) -> list[float]:
+        """One normalized row: pi(. | o, reasoning) over ``admissible`` with the
+        natural prompt's token ids ``o_ids`` (the elicitation instruction is not
+        part of the scored context)."""
+        shim = types.SimpleNamespace(
+            message=types.SimpleNamespace(
+                content=reasoning, tokens=types.SimpleNamespace(prompt_ids=list(o_ids))
+            )
+        )
+        mat = await self._score_pi_hat_matrix(nstate, [shim], admissible, admissible[0], renorm=True)
+        return list(mat.cond[0])
+
+    async def elicit_block(self, client, model: str, prompt_messages, action: str, sampling_args: dict) -> str:
+        """One completion under ``prompt_messages + [user(elicit_prompt)]`` (D-4).
+        Returns the raw completion text; the instruction is never stored."""
+        nstate = self._node_state(client, model, sampling_args)
+        instruction = vf.UserMessage(content=self.elicit_prompt.format(action=action))
+        prompt = list(prompt_messages) + [instruction]
+        resp = (await self._generate_node_responses(nstate, prompt, 1, sampling_args))[0]
+        return resp.message.content or ""
+
+    async def synthesize_block(
+        self,
+        client,
+        model: str,
+        prompt_messages,
+        admissible: list[str],
+        action: str,
+        node: NodeScore,
+        block_sampling_args: dict,
+    ) -> Synthesis:
+        """A congruent reasoning block for ``action`` at this node (D-3, D-4).
+
+        1. Sampled candidates: the node's blocks whose row argmax is ``action``,
+           accepted when the row value at ``action`` reaches tau.
+        2. Up to n_elicit elicited blocks, each stripped to its reasoning,
+           rejected on an empty prefix ("parse") or a leak ("leak"), scored under
+           the NATURAL prompt and accepted by the same test; a rejection records
+           "tau" (argmax but below tau) or "argmax" (another action tops the row).
+
+        Always returns a Synthesis: ``source`` is "sampled" / "elicited" on
+        success and "none" when every candidate was rejected (``attempts`` and
+        ``reject_reasons`` then say why; the branch is skipped, D-3).
+        """
+        if action not in admissible:
+            raise ValueError(f"synthesize_block: {action!r} is not admissible")
+        tau = float(self.tau)
+        reasons: list[str] = []
+        for i, led in enumerate(node.lead):
+            if led != action:
+                continue
+            reasoning = node.texts[i]
+            if not reasoning:
+                reasons.append("parse")
+                continue
+            ok, p = congruent(node.rows[i], admissible, action, tau)
+            if ok:
+                return Synthesis(
+                    reasoning=reasoning,
+                    source="sampled",
+                    p_accept=p,
+                    attempts=0,
+                    reject_reasons=reasons,
+                    block_idx=i,
+                    completion_text=format_forced_completion(reasoning, action),
+                )
+            reasons.append(reject_reason(node.rows[i], admissible, action, tau))
+
+        nstate = self._node_state(client, model, block_sampling_args)
+        self._ensure_tokenizer(nstate)
+        attempts = 0
+        for _ in range(int(self.n_elicit)):
+            attempts += 1
+            text = await self.elicit_block(client, model, prompt_messages, action, block_sampling_args)
+            reasoning = strip_to_reasoning(text)
+            if not reasoning:
+                reasons.append("parse")
+                continue
+            if leaks(reasoning, self.leak_patterns):
+                reasons.append("leak")
+                continue
+            row = await self._score_row(nstate, node.o_ids, reasoning, admissible)
+            ok, p = congruent(row, admissible, action, tau)
+            if ok:
+                return Synthesis(
+                    reasoning=reasoning,
+                    source="elicited",
+                    p_accept=p,
+                    attempts=attempts,
+                    reject_reasons=reasons,
+                    block_idx=None,
+                    completion_text=format_forced_completion(reasoning, action),
+                )
+            reasons.append(reject_reason(row, admissible, action, tau))
+        return Synthesis(
+            reasoning="",
+            source="none",
+            p_accept=0.0,
+            attempts=attempts,
+            reject_reasons=reasons,
+            block_idx=None,
+            completion_text="",
+        )
+
+    def build_forced_step(
+        self,
+        trunk_step: dict,
+        synthesis: Synthesis,
+        action: str,
+        branch_id: str,
+        admissible: list[str],
+        model: str | None = None,
+    ) -> dict:
+        """A TrajectoryStep-shaped dict for the forced turn (branch-schema.md §2).
+
+        prompt / prompt tokens are the trunk step's (the same o_t); the completion
+        is the verified reasoning plus ``<action>action</action>``; completion_ids
+        are the local tokenizer's encoding of that text plus the EOS id (what the
+        inference server returns for a real turn is the sampled ids ending in EOS,
+        so this is the closest offline reproduction); logprobs are zeros (value
+        training never reads them). Consumable by prime-rl's interleave_rollout.
+        """
+        if synthesis.source == "none":
+            raise ValueError("build_forced_step: synthesis did not produce a block")
+        if self._tokenizer is None:
+            self._ensure_tokenizer({"model": model})
+        completion_text = synthesis.completion_text
+        ids = [int(t) for t in self._tokenizer.encode(completion_text, add_special_tokens=False)]
+        eos = getattr(self._tokenizer, "eos_token_id", None)
+        if eos is not None:
+            ids.append(int(eos))
+        tokens_in = dict(trunk_step.get("tokens") or {})
+        n = len(ids)
+        tokens = {
+            "prompt_ids": list(tokens_in.get("prompt_ids") or []),
+            "prompt_mask": list(tokens_in.get("prompt_mask") or []),
+            "completion_ids": ids,
+            "completion_mask": [1] * n,
+            "completion_logprobs": [0.0] * n,
+            "overlong_prompt": False,
+            "is_truncated": False,
+            "routed_experts": None,
+            "completion_top_k_token_ids": None,
+        }
+        p_accept = float(synthesis.p_accept)
+        return {
+            "prompt": list(trunk_step.get("prompt") or []),
+            # wire form (role/content dict), like a step that crossed the env server
+            "completion": [{"role": "assistant", "content": completion_text}],
+            "response": None,
+            "tokens": tokens,
+            "reward": None,
+            "advantage": None,
+            "is_truncated": False,
+            "trajectory_id": branch_id,
+            "extras": {
+                "admissible_actions": list(admissible),
+                "executed_action": action,
+                "pi_hat": p_accept,
+                "branch": {
+                    "forced": True,
+                    "block_source": synthesis.source,
+                    "p_accept": p_accept,
+                    "block_idx": synthesis.block_idx,
+                },
+            },
+        }
+
+    async def _reset_engine(self, game_file: str):
+        """Make + reset the TextWorld engine for ``game_file`` with the OSError
+        retry policy. Returns (tw_env, obs, infos). Shared by the ordinary and the
+        seeded setup_state."""
         tw_env = await asyncio.to_thread(self._make_tw_env, game_file)
 
         def _reset():
@@ -800,41 +1220,91 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 f"setup_state failed for {game_file!r} after 3 OSError retries: "
                 f"{last_oserror}"
             ) from last_oserror
+        return tw_env, obs, infos
 
+    async def _setup_state_from_seed(self, state: vf.State, seed: dict) -> vf.State:
+        """Seeded entry for a branch episode (D-11, D-12, D-13).
+
+        Replays the trunk's executed actions to the root, checks the replay
+        invariant (the formatted observation must equal what the trunk's policy
+        saw at that turn), steps the forced action, and installs the conversation
+        the ordinary loop continues from: the trunk's prompt (already in
+        state["prompt"] from init_state) + the recorded turns before the root +
+        the forced assistant turn + the new observation. The trajectory starts
+        empty; the turns the seed consumed are accounted for by
+        ``_branch_turn_offset`` in max_turns_reached.
+        """
+        if not getattr(self, "branch_mode", False):
+            raise vf.Error("branch_seed present but the env was not loaded with branch_mode=True")
+        required = ("actions_prefix", "expected_obs", "forced_action", "forced_completion", "completion_prefix", "turn")
+        missing = [k for k in required if k not in seed]
+        if missing:
+            raise vf.Error(f"branch_seed missing keys: {missing}")
+
+        game_file = state["info"]["game_file"]
+        tw_env, obs, infos = await self._reset_engine(game_file)
+
+        def _step(action):
+            with _TW_PARSE_LOCK:
+                return tw_env.step([action])
+
+        try:
+            for i, action in enumerate(list(seed["actions_prefix"])):
+                obs, _reward, done, infos = await asyncio.wait_for(
+                    asyncio.to_thread(_step, action), timeout=120.0
+                )
+                if done[0]:
+                    raise vf.Error(
+                        f"replay invariant failed: episode ended at prefix step {i} ({action!r})"
+                    )
+            got = self._format_obs(obs[0], infos["admissible_commands"][0])
+            if got != seed["expected_obs"]:
+                raise vf.Error(
+                    "replay invariant failed: the observation at the root differs from the trunk's"
+                )
+            obs, _reward, done, infos = await asyncio.wait_for(
+                asyncio.to_thread(_step, seed["forced_action"]), timeout=120.0
+            )
+        except BaseException:
+            try:
+                tw_env.close()
+            except Exception:
+                pass
+            raise
+
+        new_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
         state["alf_env"] = tw_env
         state["won"] = False
-        # Truncation metrics — initialised here so they are always present in
-        # state even for episodes where truncation never fires.
         state["context_truncated"] = False
         state["context_truncated_at_turn"] = None
         state["context_evictions"] = 0
         state["num_admissible"] = 0
         state["num_format_compliant"] = 0
         state["_last_admissible_commands"] = infos["admissible_commands"][0]
-        if getattr(self, "oracle", "off") != "off":
-            self._oracle_setup(state, game_file, obs[0], infos)
-        initial_obs = self._format_obs(obs[0], infos["admissible_commands"][0])
-        state["prompt"] = list(state["prompt"]) + [vf.UserMessage(content=initial_obs)]
+        state["_branch_turn_offset"] = int(seed["turn"]) + 1
+        state["branch"] = {
+            "trunk_id": seed.get("trunk_id"),
+            "branch_id": seed.get("branch_id"),
+            "turn": int(seed["turn"]),
+            "forced_action": seed["forced_action"],
+            "replay_ok": True,
+        }
+        prefix = self._messages_from_raw(seed["completion_prefix"])
+        forced_msg = vf.AssistantMessage(content=seed["forced_completion"])
+        obs_msg = vf.UserMessage(content=new_obs)
+        state["prompt"] = list(state["prompt"]) + prefix + [forced_msg, obs_msg]
+        if done[0]:
+            state["won"] = bool(infos["won"][0])
+            state["final_env_response"] = [obs_msg]
         return state
 
-    @vf.cleanup
-    async def cleanup_alf_env(self, state: vf.State):
-        tw_env = state.pop("alf_env", None)
-        if tw_env is not None:
-            try:
-                tw_env.close()
-            except Exception:
-                pass
-        # Action-level ARM (Phase 3): drop the transient m-block stash so it never
-        # serializes into the RolloutOutput (it carries raw Response objects and is
-        # consumed same-turn in Phase 4). Overwritten each turn; this is the
-        # belt-and-suspenders end-of-rollout pop.
-        state.pop("_pending_reasoning_blocks", None)
-        state.pop("_executed_block_idx", None)
-        # Training-time probe: the oracle agent is not serializable; the last
-        # proposal was consumed by add_trajectory_step.
-        state.pop("_probe_oracle_agent", None)
-        state.pop("_probe_oracle_last", None)
+    @vf.stop
+    async def max_turns_reached(self, state: vf.State) -> bool:
+        """MultiTurnEnv's max_turns stop, offset by the turns a branch seed
+        consumed before the episode was handed to the loop (D-12). Without a
+        seed the offset is 0 and this is the parent's rule verbatim."""
+        offset = int(state.get("_branch_turn_offset", 0) or 0)
+        return self.max_turns > 0 and len(state["trajectory"]) + offset >= self.max_turns
 
     # ------------------------------------------------------------------
     # Training-time probe: oracle (Phase 1, D-6)
@@ -1083,6 +1553,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         blocks: list,
         admissible: list[str],
         a_star: str,
+        renorm: bool | None = None,
     ):
         """Teacher-force-score every admissible action against every reasoning block.
 
@@ -1174,7 +1645,9 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # prefix-cache hits on [o, R_j]).
         logps = await self._score_continuations(client, all_prompts, all_spans, model)
 
-        renorm = bool(getattr(self, "pi_hat_renorm", True))
+        # renorm=None: the env's convention (pi_hat_renorm). The branched-dataset
+        # node primitives pass True explicitly (D-5).
+        renorm = bool(getattr(self, "pi_hat_renorm", True)) if renorm is None else bool(renorm)
         cond: list[list[float]] = []
         Z: list[float] = []
         raw: list[list[float]] = []
@@ -1881,6 +2354,11 @@ def load_environment(
     oracle: str = "off",
     store_raw_logps: bool = False,
     pi_hat_renorm: bool = True,
+    branch_mode: bool = False,
+    tau: float = 0.5,
+    n_elicit: int = 3,
+    elicit_prompt: str | None = None,
+    leak_patterns: list[str] | None = None,
 ) -> vf.Environment:
     """
     Args:
@@ -1906,6 +2384,14 @@ def load_environment(
             admissible union (the pre-2026-11-07 convention); False = raw sequence
             probabilities, no renormalization (training-probe D-13). Applies to
             the training path and to probe capture alike.
+        branch_mode: Branched dataset (plan/branched-dataset). Honors
+            info["branch_seed"] in setup_state (replay to a trunk decision
+            point, force one action, continue). The node primitives
+            (score_node / synthesize_block / build_forced_step) are explicit
+            calls on a branch_mode instance. Off on the training path.
+        tau / n_elicit / elicit_prompt / leak_patterns: synthesize_block's
+            acceptance threshold on the normalized row, elicitation attempts,
+            instruction template ({action}), and leak regexes (D-4).
     """
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
@@ -1941,6 +2427,11 @@ def load_environment(
         oracle=oracle,
         store_raw_logps=store_raw_logps,
         pi_hat_renorm=pi_hat_renorm,
+        branch_mode=branch_mode,
+        tau=tau,
+        n_elicit=n_elicit,
+        elicit_prompt=elicit_prompt,
+        leak_patterns=leak_patterns,
         env_id="alfworld-env",
     )
     return env
