@@ -807,3 +807,44 @@ def test_strong_elicited_block_still_stops_early_under_theta():
     assert syn.p_accept >= env.tau
     assert [e.get("accepted") for e in syn.attempt_log] == [None, "strong"]
     assert syn.attempt_log[0]["block_idx"] == 3
+
+
+# ---------------------------------------------------------------------------
+# elicitation template variants (paired A/B on the same (o, action))
+# ---------------------------------------------------------------------------
+
+ALT = "ALT {action}"
+AB_ROWS = [
+    [-0.1, -3.0, -3.0, -2.5],  # attempt 1, template 0: weak
+    [-3.0, -3.0, -3.0, -0.1],  # attempt 2, template 1: strong (~0.87)
+    [-0.1, -3.0, -3.0, -3.0],  # attempt 3, template 0: weak
+    [-0.5, -3.0, -3.0, -1.0],  # attempt 4, template 1: weak (~0.34)
+]
+
+
+def test_exhaustive_elicitation_cycles_templates_and_logs_the_variant():
+    env = _env(theta=0.0, n_elicit=4, elicit_variants=[ALT], elicit_exhaustive=True)
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(4)
+    env._score_continuations = _scorer([list(r) for r in AB_ROWS], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    # no early stop at the strong attempt 2: all four ran
+    assert syn.attempts == 4
+    assert syn.source == "elicited" and syn.reasoning == "<think>e2</think>\n"
+    assert syn.p_accept == pytest.approx(_softmax(AB_ROWS[1])[3])
+    assert [e.get("variant") for e in syn.attempt_log] == [None, 0, 1, 0, 1]
+    assert [e.get("accepted") for e in syn.attempt_log] == [None, None, "strong", None, None]
+    assert syn.reject_reasons == ["argmax", "argmax", "argmax"]
+    sent = [c["prompt"][-1].content for c in client.calls[2:]]
+    assert sent == [ELICIT_DEFAULT.format(action=SHELF), ALT.format(action=SHELF)] * 2
+
+
+def test_variants_without_exhaustive_stop_at_the_first_strong_attempt():
+    env = _env(theta=0.0, n_elicit=4, elicit_variants=[ALT])
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(4)
+    env._score_continuations = _scorer([list(r) for r in AB_ROWS], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.attempts == 2 and syn.source == "elicited"
+    assert [e.get("variant") for e in syn.attempt_log] == [None, 0, 1]
+    assert syn.attempt_log[-1]["accepted"] == "strong"

@@ -276,6 +276,8 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         theta: float | None = None,
         n_elicit: int = 3,
         elicit_prompt: str | None = None,
+        elicit_variants: list[str] | None = None,
+        elicit_exhaustive: bool = False,
         leak_patterns: list[str] | None = None,
         **kwargs,
     ):
@@ -354,6 +356,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             raise ValueError(f"theta must be in [0, tau]; got theta={self.theta}, tau={self.tau}")
         self.n_elicit = int(n_elicit)
         self.elicit_prompt = elicit_prompt if elicit_prompt is not None else ELICIT_DEFAULT
+        # Extra elicitation templates cycled after elicit_prompt (attempt k uses
+        # template k mod n). elicit_exhaustive runs every attempt even after a
+        # strong one, so the templates are compared on the same (o, action).
+        self.elicit_variants = list(elicit_variants or [])
+        self.elicit_exhaustive = bool(elicit_exhaustive)
         self.leak_patterns = list(leak_patterns) if leak_patterns is not None else list(LEAK_DEFAULT)
 
     # ------------------------------------------------------------------
@@ -1025,11 +1032,15 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         mat = await self._score_pi_hat_matrix(nstate, [shim], admissible, admissible[0], renorm=True)
         return list(mat.cond[0])
 
-    async def elicit_block(self, client, model: str, prompt_messages, action: str, sampling_args: dict) -> str:
-        """One completion under ``prompt_messages + [user(elicit_prompt)]`` (D-4).
-        Returns the raw completion text; the instruction is never stored."""
+    async def elicit_block(
+        self, client, model: str, prompt_messages, action: str, sampling_args: dict,
+        template: str | None = None,
+    ) -> str:
+        """One completion under ``prompt_messages + [user(instruction)]`` (D-4),
+        the instruction being ``template`` (default: elicit_prompt) with {action}
+        substituted. Returns the raw completion text; the instruction is never stored."""
         nstate = self._node_state(client, model, sampling_args)
-        instruction = vf.UserMessage(content=self.elicit_prompt.format(action=action))
+        instruction = vf.UserMessage(content=(template or self.elicit_prompt).format(action=action))
         prompt = self._messages_from_raw(prompt_messages) + [instruction]
         resp = (await self._generate_node_responses(nstate, prompt, 1, sampling_args))[0]
         return resp.message.content or ""
@@ -1119,36 +1130,49 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
         nstate = self._node_state(client, model, block_sampling_args)
         self._ensure_tokenizer(nstate)
+        # Attempt k uses template k mod n (elicit_prompt first, then elicit_variants).
+        templates = [self.elicit_prompt] + list(getattr(self, "elicit_variants", None) or [])
+        exhaustive = bool(getattr(self, "elicit_exhaustive", False))
+        strong: dict | None = None
         attempts = 0
-        for _ in range(int(self.n_elicit)):
+        for k in range(int(self.n_elicit)):
             attempts += 1
-            text = await self.elicit_block(client, model, prompt_messages, action, block_sampling_args)
+            variant = k % len(templates)
+            text = await self.elicit_block(
+                client, model, prompt_messages, action, block_sampling_args, template=templates[variant]
+            )
             reasoning = strip_to_reasoning(text)
             if not reasoning:
                 reasons.append("parse")
-                log.append({"stage": "elicited", "reason": "parse", "text": (text or "")[:300]})
+                log.append({"stage": "elicited", "variant": variant, "reason": "parse", "text": (text or "")[:300]})
                 continue
             if leaks(reasoning, self.leak_patterns):
                 reasons.append("leak")
-                log.append({"stage": "elicited", "reason": "leak", "reasoning": reasoning})
+                log.append({"stage": "elicited", "variant": variant, "reason": "leak", "reasoning": reasoning})
                 continue
             row = await self._score_row(nstate, node.o_ids, reasoning, admissible)
             ok, p = congruent(row, admissible, action, tau)
             _, rank, top = row_stats(row, admissible, action)
-            entry = {"stage": "elicited", "reasoning": reasoning, "p": p, "rank": rank, "argmax": top}
+            entry = {"stage": "elicited", "variant": variant, "reasoning": reasoning, "p": p, "rank": rank,
+                     "argmax": top}
             log.append(entry)
             if ok:
-                entry["accepted"] = "strong"
-                return Synthesis(
-                    reasoning=reasoning,
-                    source="elicited",
-                    p_accept=p,
-                    attempts=attempts,
-                    reject_reasons=reasons,
-                    block_idx=None,
-                    completion_text=format_forced_completion(reasoning, action),
-                    attempt_log=log,
-                )
+                if not exhaustive:
+                    entry["accepted"] = "strong"
+                    return Synthesis(
+                        reasoning=reasoning,
+                        source="elicited",
+                        p_accept=p,
+                        attempts=attempts,
+                        reject_reasons=reasons,
+                        block_idx=None,
+                        completion_text=format_forced_completion(reasoning, action),
+                        attempt_log=log,
+                    )
+                # exhaustive: keep going so every template is tried; best strong wins
+                if strong is None or p > strong["p"]:
+                    strong = {"reasoning": reasoning, "p": p, "entry": entry}
+                continue
             reason = reject_reason(row, admissible, action, tau)
             entry["reason"] = reason
             reasons.append(reason)
@@ -1156,6 +1180,18 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 best_key = (p, 1)
                 best = {"source": "elicited", "reasoning": reasoning, "block_idx": None, "p": p, "entry": entry}
 
+        if strong is not None:
+            strong["entry"]["accepted"] = "strong"
+            return Synthesis(
+                reasoning=strong["reasoning"],
+                source="elicited",
+                p_accept=strong["p"],
+                attempts=attempts,
+                reject_reasons=reasons,
+                block_idx=None,
+                completion_text=format_forced_completion(strong["reasoning"], action),
+                attempt_log=log,
+            )
         if theta < tau and best is not None and best["p"] >= theta:
             best["entry"]["accepted"] = "weak"
             return Synthesis(
@@ -2437,6 +2473,8 @@ def load_environment(
     theta: float | None = None,
     n_elicit: int = 3,
     elicit_prompt: str | None = None,
+    elicit_variants: list[str] | None = None,
+    elicit_exhaustive: bool = False,
     leak_patterns: list[str] | None = None,
 ) -> vf.Environment:
     """
@@ -2511,6 +2549,8 @@ def load_environment(
         theta=theta,
         n_elicit=n_elicit,
         elicit_prompt=elicit_prompt,
+        elicit_variants=elicit_variants,
+        elicit_exhaustive=elicit_exhaustive,
         leak_patterns=leak_patterns,
         env_id="alfworld-env",
     )
