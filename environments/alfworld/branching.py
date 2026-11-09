@@ -70,12 +70,17 @@ class Synthesis:
     """Output of ALFWorldEnvironment.synthesize_block (D-4)."""
 
     reasoning: str
-    source: str  # "sampled" | "elicited"
+    source: str  # "sampled" | "elicited" | "none"
+    # Row value at the action for the returned block; < tau = weak (D-17).
     p_accept: float
     attempts: int
     reject_reasons: list[str]
     block_idx: int | None
     completion_text: str
+    # One entry for the best sampled block and one per elicitation attempt,
+    # whatever the outcome: stage, p (row value at the action), rank, argmax,
+    # the reasoning text for elicited attempts, and "accepted" / "reason".
+    attempt_log: list[dict] = field(default_factory=list)
 
 
 def lead_actions(rows: list[list[float]]) -> list[int]:
@@ -147,6 +152,15 @@ def reject_reason(row: list[float], admissible: list[str], action: str, tau: flo
     else "tau" when the action tops it below the threshold."""
     i = admissible.index(action)
     return "tau" if lead_actions([row])[0] == i else "argmax"
+
+
+def row_stats(row: list[float], admissible: list[str], action: str) -> tuple[float, int, str]:
+    """(p, rank, argmax action) of ``action`` in a normalized row. Rank 1 is
+    the top: 1 + the number of entries strictly above the action's value."""
+    i = admissible.index(action)
+    p = float(row[i])
+    rank = 1 + sum(1 for v in row if v > p)
+    return p, rank, admissible[lead_actions([row])[0]]
 
 
 _LEAK_CACHE: dict[tuple[str, ...], list[re.Pattern]] = {}

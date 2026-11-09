@@ -713,3 +713,97 @@ def test_constructor_defaults_and_passthrough():
     env2 = ALFWorldEnvironment(branch_mode=True, tau=0.7, n_elicit=1, elicit_prompt="Do {action}", leak_patterns=["x"])
     assert env2.branch_mode is True and env2.tau == 0.7 and env2.n_elicit == 1
     assert env2.elicit_prompt == "Do {action}" and env2.leak_patterns == ["x"]
+
+
+# ---------------------------------------------------------------------------
+# synthesize_block: weak acceptance by probability threshold (D-17)
+# ---------------------------------------------------------------------------
+# p("examine shelf 1") over the node's four sampled blocks is ~0.049, 0.032,
+# 0.052, 0.092: no block leads to it and block 3 is the best sampled candidate.
+
+SHELF = "examine shelf 1"
+ELICITED_ROWS = [
+    [-0.1, -3.0, -3.0, -2.5],  # p(shelf) ~ 0.076, desk on top
+    [-0.5, -3.0, -3.0, -1.0],  # p(shelf) ~ 0.343, desk on top
+    [-0.1, -3.0, -3.0, -3.0],  # p(shelf) ~ 0.047, desk on top
+]
+
+
+def _elicit_scripts(n):
+    return [[f"<think>e{k + 1}</think>\n<action>{SHELF}</action>"] for k in range(n)]
+
+
+def test_weak_acceptance_takes_best_elicited_attempt():
+    env = _env(theta=0.01)
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(3)
+    env._score_continuations = _scorer([list(r) for r in ELICITED_ROWS], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.source == "elicited"
+    assert syn.block_idx is None
+    assert syn.attempts == 3
+    assert syn.reject_reasons == ["argmax", "argmax", "argmax"]
+    assert syn.reasoning == "<think>e2</think>\n"
+    assert syn.completion_text == f"<think>e2</think>\n<action>{SHELF}</action>"
+    assert syn.p_accept == pytest.approx(_softmax(ELICITED_ROWS[1])[3])
+    assert syn.p_accept < env.tau  # weak
+    # one entry for the best sampled block, one per elicitation attempt
+    assert [e["stage"] for e in syn.attempt_log] == ["sampled", "elicited", "elicited", "elicited"]
+    assert syn.attempt_log[0]["block_idx"] == 3
+    assert syn.attempt_log[0]["p"] == pytest.approx(_softmax(RAW_NODE[3])[3])
+    assert [e.get("accepted") for e in syn.attempt_log] == [None, None, "weak", None]
+    assert syn.attempt_log[2]["rank"] == 2 and syn.attempt_log[2]["argmax"] == "go to desk 1"
+    assert syn.attempt_log[1]["reasoning"] == "<think>e1</think>\n"
+
+
+def test_weak_acceptance_falls_back_to_best_sampled_block():
+    env = _env(theta=0.0, n_elicit=1)
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(1)
+    env._score_continuations = _scorer([list(ELICITED_ROWS[2])], seen)  # 0.047 < block 3's 0.092
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.source == "sampled"
+    assert syn.block_idx == 3
+    assert syn.attempts == 1
+    assert syn.reasoning == "<think>dresser plan</think>\n"
+    assert syn.completion_text == f"<think>dresser plan</think>\n<action>{SHELF}</action>"
+    assert syn.p_accept == pytest.approx(_softmax(RAW_NODE[3])[3])
+    assert syn.attempt_log[0]["accepted"] == "weak"
+
+
+def test_weak_candidate_below_theta_is_rejected():
+    env = _env(theta=0.2, n_elicit=1)
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(1)
+    env._score_continuations = _scorer([list(ELICITED_ROWS[2])], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.source == "none"
+    assert syn.reject_reasons == ["argmax"]
+    assert len(syn.attempt_log) == 2
+    assert all("accepted" not in e for e in syn.attempt_log)
+
+
+def test_theta_unset_keeps_the_strong_only_rule():
+    env = _env(n_elicit=1)  # no theta attribute: theta = tau
+    node, client, seen = _node(env)
+    client.scripts = _elicit_scripts(1)
+    env._score_continuations = _scorer([list(ELICITED_ROWS[1])], seen)  # 0.343 would pass a weak rule
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, SHELF, node, BLOCK_ARGS))
+    assert syn.source == "none"
+    # the attempt is logged with its p all the same
+    assert syn.attempt_log[1]["p"] == pytest.approx(_softmax(ELICITED_ROWS[1])[3])
+    assert syn.attempt_log[1]["reason"] == "argmax"
+
+
+def test_strong_elicited_block_still_stops_early_under_theta():
+    env = _env(tau=0.7, theta=0.1)
+    node, client, seen = _node(env)
+    # dresser: block 3 leads to it below tau ("tau"); the first elicitation is strong
+    client.scripts = [["<think>The dresser is the likely spot.</think>\n<action>go to dresser 1</action>"]]
+    env._score_continuations = _scorer([[-3.0, -3.0, -0.1, -3.0]], seen)
+    syn = asyncio.run(env.synthesize_block(client, "m", PROMPT, ADM, "go to dresser 1", node, BLOCK_ARGS))
+    assert syn.source == "elicited" and syn.attempts == 1
+    assert syn.reject_reasons == ["tau"]
+    assert syn.p_accept >= env.tau
+    assert [e.get("accepted") for e in syn.attempt_log] == [None, "strong"]
+    assert syn.attempt_log[0]["block_idx"] == 3

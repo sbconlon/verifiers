@@ -126,3 +126,14 @@ def test_format_forced_completion_matches_scored_string():
 def test_elicit_default_has_action_slot():
     assert "{action}" in ELICIT_DEFAULT
     assert "open drawer 1" in ELICIT_DEFAULT.format(action="open drawer 1")
+
+
+def test_row_stats_p_rank_and_argmax():
+    from environments.alfworld.branching import row_stats
+
+    adm = ["a", "b", "c"]
+    assert row_stats([0.2, 0.7, 0.1], adm, "b") == (0.7, 1, "b")
+    assert row_stats([0.2, 0.7, 0.1], adm, "a") == (0.2, 2, "b")
+    assert row_stats([0.2, 0.7, 0.1], adm, "c") == (0.1, 3, "b")
+    # ties share a rank: nothing is strictly above either 0.4
+    assert row_stats([0.4, 0.4, 0.2], adm, "b")[1] == 1

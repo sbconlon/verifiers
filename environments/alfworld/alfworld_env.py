@@ -74,6 +74,7 @@ try:
         leaks,
         ranked_distinct,
         reject_reason,
+        row_stats,
         strip_to_reasoning,
     )
 except ImportError:
@@ -89,6 +90,7 @@ except ImportError:
         leaks,
         ranked_distinct,
         reject_reason,
+        row_stats,
         strip_to_reasoning,
     )
 
@@ -271,6 +273,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         pi_hat_renorm: bool = True,
         branch_mode: bool = False,
         tau: float = 0.5,
+        theta: float | None = None,
         n_elicit: int = 3,
         elicit_prompt: str | None = None,
         leak_patterns: list[str] | None = None,
@@ -344,6 +347,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         # parameterize synthesize_block (D-4). Off by default: byte-identical.
         self.branch_mode = branch_mode
         self.tau = float(tau)
+        # D-17: theta < tau enables weak acceptance (the best candidate whose
+        # row value at the action is >= theta); None keeps the strong-only rule.
+        self.theta = float(tau) if theta is None else float(theta)
+        if not 0.0 <= self.theta <= self.tau:
+            raise ValueError(f"theta must be in [0, tau]; got theta={self.theta}, tau={self.tau}")
         self.n_elicit = int(n_elicit)
         self.elicit_prompt = elicit_prompt if elicit_prompt is not None else ELICIT_DEFAULT
         self.leak_patterns = list(leak_patterns) if leak_patterns is not None else list(LEAK_DEFAULT)
@@ -1036,42 +1044,78 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         node: NodeScore,
         block_sampling_args: dict,
     ) -> Synthesis:
-        """A congruent reasoning block for ``action`` at this node (D-3, D-4).
+        """A reasoning block for ``action`` at this node (D-3, D-4, D-17).
 
-        1. Sampled candidates: the node's blocks whose row argmax is ``action``,
-           accepted when the row value at ``action`` reaches tau.
+        Strong acceptance (the original rule): the row value at ``action`` under
+        the NATURAL prompt reaches tau. With tau >= 0.5 that already implies the
+        action tops the row, so "argmax" is not a separate requirement.
+
+        1. Sampled candidates: the node's blocks that lead to ``action``; the
+           first strong one is returned.
         2. Up to n_elicit elicited blocks, each stripped to its reasoning,
            rejected on an empty prefix ("parse") or a leak ("leak"), scored under
-           the NATURAL prompt and accepted by the same test; a rejection records
-           "tau" (argmax but below tau) or "argmax" (another action tops the row).
+           the natural prompt; the first strong one is returned. A non-strong
+           attempt records "tau" (the action tops the row below tau) or "argmax"
+           (another action tops it).
+        3. Weak acceptance (D-17, only when theta < tau): the best candidate seen
+           -- every sampled block with a reasoning and every scorable elicited
+           attempt, by the row value at ``action``, elicited winning ties -- is
+           returned when that value is >= theta. ``p_accept`` < tau marks it weak.
 
         Always returns a Synthesis: ``source`` is "sampled" / "elicited" on
-        success and "none" when every candidate was rejected (``attempts`` and
-        ``reject_reasons`` then say why; the branch is skipped, D-3).
+        success and "none" when nothing was accepted. ``attempt_log`` holds one
+        entry for the best sampled block and one per elicitation attempt (p,
+        rank, argmax, the reasoning text for elicited ones), whatever the outcome,
+        so the acceptance-vs-theta curve can be read off afterwards.
         """
         if action not in admissible:
             raise ValueError(f"synthesize_block: {action!r} is not admissible")
         tau = float(self.tau)
+        theta = float(getattr(self, "theta", tau))
+        i_act = admissible.index(action)
         reasons: list[str] = []
+        log: list[dict] = []
+        # best weak candidate so far: (p, 1 if elicited else 0), with its payload
+        best_key: tuple[float, int] | None = None
+        best: dict | None = None
+
+        best_sampled: tuple[float, int] | None = None
         for i, led in enumerate(node.lead):
-            if led != action:
-                continue
             reasoning = node.texts[i]
+            if led == action:
+                if not reasoning:
+                    reasons.append("parse")
+                    continue
+                ok, p = congruent(node.rows[i], admissible, action, tau)
+                if ok:
+                    _, rank, top = row_stats(node.rows[i], admissible, action)
+                    log.append(
+                        {"stage": "sampled", "block_idx": i, "p": p, "rank": rank, "argmax": top,
+                         "accepted": "strong"}
+                    )
+                    return Synthesis(
+                        reasoning=reasoning,
+                        source="sampled",
+                        p_accept=p,
+                        attempts=0,
+                        reject_reasons=reasons,
+                        block_idx=i,
+                        completion_text=format_forced_completion(reasoning, action),
+                        attempt_log=log,
+                    )
+                reasons.append(reject_reason(node.rows[i], admissible, action, tau))
             if not reasoning:
-                reasons.append("parse")
                 continue
-            ok, p = congruent(node.rows[i], admissible, action, tau)
-            if ok:
-                return Synthesis(
-                    reasoning=reasoning,
-                    source="sampled",
-                    p_accept=p,
-                    attempts=0,
-                    reject_reasons=reasons,
-                    block_idx=i,
-                    completion_text=format_forced_completion(reasoning, action),
-                )
-            reasons.append(reject_reason(node.rows[i], admissible, action, tau))
+            p = float(node.rows[i][i_act])
+            if best_sampled is None or p > best_sampled[0]:
+                best_sampled = (p, i)
+        if best_sampled is not None:
+            p, i = best_sampled
+            _, rank, top = row_stats(node.rows[i], admissible, action)
+            entry = {"stage": "sampled", "block_idx": i, "p": p, "rank": rank, "argmax": top}
+            log.append(entry)
+            best_key = (p, 0)
+            best = {"source": "sampled", "reasoning": node.texts[i], "block_idx": i, "p": p, "entry": entry}
 
         nstate = self._node_state(client, model, block_sampling_args)
         self._ensure_tokenizer(nstate)
@@ -1082,13 +1126,19 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             reasoning = strip_to_reasoning(text)
             if not reasoning:
                 reasons.append("parse")
+                log.append({"stage": "elicited", "reason": "parse", "text": (text or "")[:300]})
                 continue
             if leaks(reasoning, self.leak_patterns):
                 reasons.append("leak")
+                log.append({"stage": "elicited", "reason": "leak", "reasoning": reasoning})
                 continue
             row = await self._score_row(nstate, node.o_ids, reasoning, admissible)
             ok, p = congruent(row, admissible, action, tau)
+            _, rank, top = row_stats(row, admissible, action)
+            entry = {"stage": "elicited", "reasoning": reasoning, "p": p, "rank": rank, "argmax": top}
+            log.append(entry)
             if ok:
+                entry["accepted"] = "strong"
                 return Synthesis(
                     reasoning=reasoning,
                     source="elicited",
@@ -1097,8 +1147,27 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                     reject_reasons=reasons,
                     block_idx=None,
                     completion_text=format_forced_completion(reasoning, action),
+                    attempt_log=log,
                 )
-            reasons.append(reject_reason(row, admissible, action, tau))
+            reason = reject_reason(row, admissible, action, tau)
+            entry["reason"] = reason
+            reasons.append(reason)
+            if best_key is None or (p, 1) > best_key:
+                best_key = (p, 1)
+                best = {"source": "elicited", "reasoning": reasoning, "block_idx": None, "p": p, "entry": entry}
+
+        if theta < tau and best is not None and best["p"] >= theta:
+            best["entry"]["accepted"] = "weak"
+            return Synthesis(
+                reasoning=best["reasoning"],
+                source=best["source"],
+                p_accept=best["p"],
+                attempts=attempts,
+                reject_reasons=reasons,
+                block_idx=best["block_idx"],
+                completion_text=format_forced_completion(best["reasoning"], action),
+                attempt_log=log,
+            )
         return Synthesis(
             reasoning="",
             source="none",
@@ -1107,6 +1176,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             reject_reasons=reasons,
             block_idx=None,
             completion_text="",
+            attempt_log=log,
         )
 
     def build_forced_step(
@@ -2364,6 +2434,7 @@ def load_environment(
     pi_hat_renorm: bool = True,
     branch_mode: bool = False,
     tau: float = 0.5,
+    theta: float | None = None,
     n_elicit: int = 3,
     elicit_prompt: str | None = None,
     leak_patterns: list[str] | None = None,
@@ -2437,6 +2508,7 @@ def load_environment(
         pi_hat_renorm=pi_hat_renorm,
         branch_mode=branch_mode,
         tau=tau,
+        theta=theta,
         n_elicit=n_elicit,
         elicit_prompt=elicit_prompt,
         leak_patterns=leak_patterns,
