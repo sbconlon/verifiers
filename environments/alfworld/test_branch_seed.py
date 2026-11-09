@@ -283,6 +283,43 @@ def test_score_node_rejects_empty_admissible():
         asyncio.run(env.score_node(_ScriptedClient([]), "m", PROMPT, [], 3, BLOCK_ARGS))
 
 
+class _StrictClient(_ScriptedClient):
+    """Like the real OpenAI client: to_native_prompt dispatches on the message
+    classes and raises ValueError("Invalid chat message: ...") on a role/content
+    dict (what the collect driver sends; job 748578, 2026-11-09)."""
+
+    async def to_native_prompt(self, prompt):
+        for message in prompt:
+            if not hasattr(message, "role"):
+                raise ValueError(f"Invalid chat message: {message}")
+        return prompt, {}
+
+
+WIRE_PROMPT = [{"role": "system", "content": "sys"}, {"role": "user", "content": "obs0"}]
+
+
+def test_score_node_accepts_wire_form_prompt():
+    env = _env()
+    client = _StrictClient([[BLOCKS[0]], BLOCKS[1:]])
+    env._score_continuations = _scorer([list(r) for r in RAW_NODE], [])
+    node = asyncio.run(env.score_node(client, "m", WIRE_PROMPT, ADM, 3, BLOCK_ARGS))
+    assert node.own[0] == "go to desk 1"
+    assert len(client.calls) == 2
+    for call in client.calls:
+        # typed messages reached the client, equal to the typed PROMPT
+        assert call["prompt"] == PROMPT
+
+
+def test_elicit_block_accepts_wire_form_prompt():
+    env = _env()
+    client = _StrictClient([["<think>forced</think>\n<action>open drawer 1</action>"]])
+    text = asyncio.run(env.elicit_block(client, "m", WIRE_PROMPT, "open drawer 1", BLOCK_ARGS))
+    assert "open drawer 1" in text
+    sent = client.calls[0]["prompt"]
+    assert sent[:2] == PROMPT
+    assert sent[2].role == "user" and "open drawer 1" in sent[2].content
+
+
 # ---------------------------------------------------------------------------
 # synthesize_block
 # ---------------------------------------------------------------------------

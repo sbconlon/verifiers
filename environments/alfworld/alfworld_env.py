@@ -892,7 +892,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
     @staticmethod
     def _messages_from_raw(items) -> list:
-        """Wire-form (role/content dicts) or message objects -> vf messages."""
+        """Wire-form (role/content dicts) or message objects -> vf messages.
+
+        Every node primitive that takes ``prompt_messages`` runs its input
+        through this: the real client's to_native_prompt dispatches on the
+        message classes and raises on a dict."""
         out = []
         for item in items or []:
             if hasattr(item, "role") and hasattr(item, "content"):
@@ -957,6 +961,10 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             raise ValueError("score_node: empty admissible set")
         if m < 1:
             raise ValueError("score_node: m must be >= 1")
+        # The collect driver passes the trunk step's prompt in wire form
+        # (role/content dicts); the client dispatches on message classes and
+        # rejects dicts ("Invalid chat message", job 748578).
+        prompt_messages = self._messages_from_raw(prompt_messages)
         nstate = self._node_state(client, model, block_sampling_args)
         if greedy_sampling_args is None:
             greedy_sampling_args = {**dict(block_sampling_args or {}), "temperature": 0.0}
@@ -1014,7 +1022,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         Returns the raw completion text; the instruction is never stored."""
         nstate = self._node_state(client, model, sampling_args)
         instruction = vf.UserMessage(content=self.elicit_prompt.format(action=action))
-        prompt = list(prompt_messages) + [instruction]
+        prompt = self._messages_from_raw(prompt_messages) + [instruction]
         resp = (await self._generate_node_responses(nstate, prompt, 1, sampling_args))[0]
         return resp.message.content or ""
 
