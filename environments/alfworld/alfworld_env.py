@@ -98,6 +98,57 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _planner_libs(tw_env) -> list:
+    """(engine, library handle) pairs behind a textworld gym env: gym env ->
+    batch_env -> envs[i] -> wrapper chain (_wrapped_env) -> PddlEnv.downward_lib.
+    Empty for anything that does not have that shape (test doubles)."""
+    found = []
+    try:
+        batch = getattr(tw_env, "batch_env", None)
+        for env in list(getattr(batch, "envs", None) or []):
+            seen: set[int] = set()
+            while env is not None and id(env) not in seen:
+                seen.add(id(env))
+                attrs = getattr(env, "__dict__", None) or {}
+                lib = attrs.get("downward_lib")
+                if lib is not None:
+                    found.append((env, lib))
+                    break
+                env = attrs.get("_wrapped_env")
+    except Exception:  # noqa: BLE001 -- never let teardown bookkeeping raise
+        return []
+    return found
+
+
+def _close_engine(tw_env) -> None:
+    """Close a TextWorld engine AND unload its private copy of the planner library.
+
+    PddlEnv.__init__ calls fast_downward.load_lib(), which copies libdownward.so
+    (34 MB) into a TemporaryDirectory, dlopens the copy and removes the directory.
+    PddlEnv has no close() that calls fast_downward.close_lib, so the mapping --
+    and with it the deleted file's blocks on the node's /tmp -- lives until the
+    process exits. One engine per rollout, so a long-lived env worker pins 34 MB
+    per rollout: the 790-game branch collect (about 13k engines, job 750438)
+    filled gnode01's /tmp and every later reset failed with ENOSPC. Unloading
+    here bounds the footprint to the engines that are open at once.
+
+    The handles are collected BEFORE close() (the gym env drops its batch_env in
+    close()), and each engine's reference is cleared so a dangling handle can
+    never be called."""
+    libs = _planner_libs(tw_env)
+    try:
+        tw_env.close()
+    finally:
+        for env, lib in libs:
+            try:
+                import fast_downward
+
+                fast_downward.close_lib(lib)
+                env.__dict__["downward_lib"] = None
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"planner library unload failed: {exc!r}")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -851,7 +902,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tw_env = state.pop("alf_env", None)
         if tw_env is not None:
             try:
-                tw_env.close()
+                _close_engine(tw_env)
             except Exception:
                 pass
         # Action-level ARM (Phase 3): drop the transient m-block stash so it never
@@ -1335,14 +1386,14 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
                 # episode as failed (reward 0.0), and keeps the worker alive.
                 logger.warning(f"setup_state: reset() failed for {game_file!r}: {exc}")
                 try:
-                    tw_env.close()
+                    _close_engine(tw_env)
                 except Exception:
                     pass
                 raise vf.Error(f"setup_state failed for {game_file!r}: {exc}") from exc
 
         if not success:
             try:
-                tw_env.close()
+                _close_engine(tw_env)
             except Exception:
                 pass
             raise vf.Error(
@@ -1396,7 +1447,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
             )
         except BaseException:
             try:
-                tw_env.close()
+                _close_engine(tw_env)
             except Exception:
                 pass
             raise
