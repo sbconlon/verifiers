@@ -525,6 +525,19 @@ def test_probe_set_dataset_rows():
     assert [r["info"]["probe_id"] for r in rows] == [g["probe_id"] for g in games]
 
 
+def test_pps_probe_set_dataset_rows():
+    from environments.alfworld.alfworld_env import build_dataset
+
+    games = load_probe_set("alfworld-pps-24-v1")
+    rows = list(build_dataset("/data/alf", "valid_seen", probe_games=games))
+    assert len(rows) == 24
+    assert [r["info"]["probe_id"] for r in rows] == [g["probe_id"] for g in games]
+    for row, g in zip(rows, games):
+        info = row["info"]
+        assert info["role"] == "sample" and info["task_type"] == "pick_and_place_simple"
+        assert info["game_file"] == "/data/alf/" + g["game_id"] + "/game.tw-pddl"
+
+
 def test_probe_set_dataset_ignores_curriculum():
     from environments.alfworld.alfworld_env import build_dataset
 

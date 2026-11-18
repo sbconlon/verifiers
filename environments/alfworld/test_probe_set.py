@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -132,3 +133,68 @@ def test_probe_set_matches_selection_script(tmp_path):
     fresh = json.loads(out.read_text(encoding="utf-8"))["games"]
     committed = load_probe_set("alfworld-24-v1")
     assert fresh == committed
+
+
+# --------------------------------------------------------------------------
+# alfworld-pps-24-v1: the branched gate's probe set (one task type, a draw
+# with no regard to difficulty).
+# --------------------------------------------------------------------------
+
+PPS_SET = "alfworld-pps-24-v1"
+
+
+def test_pps_set_is_listed():
+    assert PPS_SET in list_probe_sets()
+    assert list_probe_sets() == sorted(list_probe_sets())
+
+
+def test_pps_set_is_24_pick_and_place_validation_games():
+    games = load_probe_set(PPS_SET)
+    assert len(games) == 24
+    assert len({g["probe_id"] for g in games}) == 24
+    assert len({g["game_id"] for g in games}) == 24
+    assert {g["task_type"] for g in games} == {"pick_and_place_simple"}
+    assert {g["role"] for g in games} == {"sample"}
+    assert Counter(g["split"] for g in games) == {"valid_seen": 12, "valid_unseen": 12}
+    for g in games:
+        # a validation game of the one task type; never a training game
+        assert g["game_id"].split("/")[0] in {"valid_seen", "valid_unseen"}
+        assert g["game_id"].split("/")[1].startswith("pick_and_place_simple-")
+
+
+def test_pps_probe_ids_follow_scheme():
+    games = load_probe_set(PPS_SET)
+    for split, tag in (("valid_seen", "seen"), ("valid_unseen", "unseen")):
+        ids = [g["probe_id"] for g in games if g["split"] == split]
+        assert ids == [f"{tag}-pps-{i:02d}" for i in range(1, 13)]
+        # numbered in game-id order, so an id does not encode the draw rank
+        gids = [g["game_id"] for g in games if g["split"] == split]
+        assert gids == sorted(gids)
+
+
+def test_pps_set_matches_selection_script(tmp_path):
+    """Rerun the thesis selection script on the frozen CSV; `games` must match."""
+    select_dir = Path(os.environ.get("PROBE_SET_SELECT_DIR", DEFAULT_SELECT_DIR))
+    script = select_dir / "select_pps_probe_games.py"
+    csv_path = select_dir / "per_problem.csv"
+    if not (script.is_file() and csv_path.is_file()):
+        pytest.skip(f"selection script not reachable at {select_dir}")
+    out = tmp_path / "fresh.json"
+    subprocess.run(
+        [sys.executable, "-I", str(script), "--per-problem", str(csv_path), "--out", str(out), "--created", "x"],
+        check=True,
+        capture_output=True,
+    )
+    fresh = json.loads(out.read_text(encoding="utf-8"))["games"]
+    assert fresh == load_probe_set(PPS_SET)
+
+
+def test_pps_set_games_exist_in_local_data():
+    """Every listed game has its game file (skipped where the data is absent)."""
+    data = Path(os.environ.get("ALFWORLD_DATA", "~/.cache/alfworld/json_2.1.1")).expanduser()
+    if not (data / "valid_seen").is_dir():
+        pytest.skip(f"ALFWorld data not found at {data}")
+    missing = [
+        g["probe_id"] for g in load_probe_set(PPS_SET) if not Path(resolve_game_file(str(data), g["game_id"])).is_file()
+    ]
+    assert missing == []

@@ -1,0 +1,273 @@
+{
+  "name": "alfworld-pps-24-v1",
+  "schema": 1,
+  "source": "phase6a-golden-graph/data/per_problem.csv, used as the list of playable validation games (35 valid_seen + 24 valid_unseen pick_and_place_simple)",
+  "rule": "per split: all pick_and_place_simple games, ranked by SHA-256 of 'alfworld-pps-24-v1:<game_id>', first 12; no outcome column is read; long_pass1 / short_pass1 (GRPO 16k / 2k window, pass@1 over 8 rollouts) are reference only",
+  "created": "2026-11-17",
+  "games": [
+    {
+      "probe_id": "seen-pps-01",
+      "game_id": "valid_seen/pick_and_place_simple-Book-None-Sofa-229/trial_T20190907_042856_259139",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-02",
+      "game_id": "valid_seen/pick_and_place_simple-Bowl-None-CoffeeTable-201/trial_T20190907_171639_045329",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-03",
+      "game_id": "valid_seen/pick_and_place_simple-Candle-None-Cart-401/trial_T20190909_081908_677973",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-04",
+      "game_id": "valid_seen/pick_and_place_simple-Candle-None-Toilet-407/trial_T20190909_055248_059513",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-05",
+      "game_id": "valid_seen/pick_and_place_simple-CellPhone-None-ArmChair-318/trial_T20190909_120047_968274",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.75,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-06",
+      "game_id": "valid_seen/pick_and_place_simple-CellPhone-None-Bed-324/trial_T20190907_233817_198528",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-07",
+      "game_id": "valid_seen/pick_and_place_simple-CreditCard-None-ArmChair-201/trial_T20190908_124340_258012",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.25,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-08",
+      "game_id": "valid_seen/pick_and_place_simple-CreditCard-None-Drawer-227/trial_T20190909_010644_297017",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.125,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-09",
+      "game_id": "valid_seen/pick_and_place_simple-Mug-None-SideTable-329/trial_T20190909_032318_169393",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-10",
+      "game_id": "valid_seen/pick_and_place_simple-SoapBottle-None-Cabinet-414/trial_T20190908_110131_524518",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 0.875,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-11",
+      "game_id": "valid_seen/pick_and_place_simple-TissueBox-None-Toilet-426/trial_T20190910_155319_795672",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "seen-pps-12",
+      "game_id": "valid_seen/pick_and_place_simple-Vase-None-CoffeeTable-207/trial_T20190909_091246_807206",
+      "split": "valid_seen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-01",
+      "game_id": "valid_unseen/pick_and_place_simple-Pencil-None-Shelf-308/trial_T20190908_121952_610012",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-02",
+      "game_id": "valid_unseen/pick_and_place_simple-Pencil-None-Shelf-308/trial_T20190908_122024_052056",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-03",
+      "game_id": "valid_unseen/pick_and_place_simple-Pencil-None-Shelf-308/trial_T20190908_122154_042763",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-04",
+      "game_id": "valid_unseen/pick_and_place_simple-SaltShaker-None-Cabinet-10/trial_T20190906_191445_723170",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-05",
+      "game_id": "valid_unseen/pick_and_place_simple-SaltShaker-None-Drawer-10/trial_T20190909_021650_880235",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 0.5,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-06",
+      "game_id": "valid_unseen/pick_and_place_simple-SaltShaker-None-Drawer-10/trial_T20190909_021728_339782",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-07",
+      "game_id": "valid_unseen/pick_and_place_simple-SoapBottle-None-Toilet-424/trial_T20190907_004351_281384",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 4,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-08",
+      "game_id": "valid_unseen/pick_and_place_simple-Vase-None-Safe-219/trial_T20190908_205204_244321",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 0.5,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-09",
+      "game_id": "valid_unseen/pick_and_place_simple-Vase-None-Safe-219/trial_T20190908_205221_748352",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-10",
+      "game_id": "valid_unseen/pick_and_place_simple-Vase-None-Safe-219/trial_T20190908_205246_776817",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 0.875,
+      "short_pass1": 0.0,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-11",
+      "game_id": "valid_unseen/pick_and_place_simple-Watch-None-Safe-219/trial_T20190907_074524_006355",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 0.875,
+      "n_rollouts": 8
+    },
+    {
+      "probe_id": "unseen-pps-12",
+      "game_id": "valid_unseen/pick_and_place_simple-Watch-None-Safe-219/trial_T20190907_074556_124850",
+      "split": "valid_unseen",
+      "task_type": "pick_and_place_simple",
+      "role": "sample",
+      "oracle_min_steps": 5,
+      "long_pass1": 1.0,
+      "short_pass1": 1.0,
+      "n_rollouts": 8
+    }
+  ]
+}

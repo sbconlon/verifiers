@@ -19,7 +19,9 @@ from pathlib import Path
 PROBE_SETS_DIR = Path(__file__).resolve().parent / "probe_sets"
 
 REQUIRED_GAME_KEYS = ("probe_id", "game_id", "split", "task_type", "role")
-ROLES = ("bite", "control")
+# bite / control: alfworld-24-v1 (picked by how a trained policy behaves on the
+# game). sample: a draw with no regard to difficulty (alfworld-pps-24-v1).
+ROLES = ("bite", "control", "sample")
 SPLITS = ("valid_seen", "valid_unseen", "train")
 GAME_FILE_NAME = "game.tw-pddl"
 
@@ -36,7 +38,7 @@ def load_probe_set(name: str) -> list[dict]:
 
     Each game dict carries at least ``probe_id``, ``game_id`` (relative to the
     ALFWorld data root, e.g. ``valid_seen/<task-dir>/<trial>``), ``split``,
-    ``task_type`` and ``role`` (``bite`` | ``control``). Order is the file's
+    ``task_type`` and ``role`` (``bite`` | ``control`` | ``sample``). Order is the file's
     order and is preserved by callers (the probe dataset is built in it).
     """
     path = PROBE_SETS_DIR / f"{name}.json"

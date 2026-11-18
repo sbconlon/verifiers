@@ -42,7 +42,7 @@ Optional mode used by the prime-rl orchestrator's probe hook (plan
 
 | Arg | Type | Default | Description |
 | --- | ---- | ------- | ----------- |
-| probe_set | str or None | None | Probe set shipped in `probe_sets/` (e.g. `alfworld-24-v1`); the dataset becomes exactly those games, in order |
+| probe_set | str or None | None | Probe set shipped in `probe_sets/` (`alfworld-24-v1`: six task types, bites and controls; `alfworld-pps-24-v1`: 24 pick_and_place_simple validation games drawn with no regard to difficulty); the dataset becomes exactly those games, in order |
 | probe_capture | bool | False | Greedy executed response + `num_reasoning_blocks` sampled blocks per turn; writes `extras["probe"]` per step (needs `num_reasoning_blocks >= 2`) |
 | probe_block_temperature | float | 0.8 | Temperature for the sampled blocks (training value) |
 | probe_block_min_p | float | 0.1 | `min_p` for the sampled blocks (training value) |
