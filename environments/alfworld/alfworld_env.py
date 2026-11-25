@@ -42,6 +42,7 @@ Branched dataset (optional, branch_mode=True; plan/branched-dataset, Phase 1):
 import asyncio
 import contextlib
 import datetime
+import itertools
 import logging
 import math
 import os
@@ -132,6 +133,24 @@ _ORACLE_FIELDS = tuple(_ORACLE_OFF)
 _TW_ENV_ID_CACHE: dict[str, str] = {}
 _TW_REGISTER_LOCK = threading.Lock()
 _TW_PARSE_LOCK = threading.Lock()
+
+# Per-process pool of idle TextWorld engines (engine_reuse=True).
+#
+# An engine maps one copy of the planner library (libdownward.so, ~35 MB) at its
+# first reset and never unmaps it, so a fresh engine per rollout pins ~35 MB of
+# node-local /tmp per rollout until the worker exits (a 790-game branch collect
+# filled 440 GB, 2026-11-10). Unloading the copy segfaults under concurrency.
+# Reuse needs no unloading: TextWorld loads the next game file into the same
+# engine object and the same library copy. A pooled engine is pointed at the
+# rollout's game and reset. Measured on the cluster (2026-11-25): one engine
+# across 5 games, 150 resets, traces identical to fresh engines, memory flat,
+# no new copy; four engines in four threads likewise.
+#
+# Keyed by oracle mode, which decides the engine's request_infos.
+_TW_ENGINE_POOL: dict[str, list] = {}
+_TW_ENGINE_POOL_LOCK = threading.Lock()
+_TW_ENGINE_POOL_MAX_IDLE = 64
+_TW_ENGINE_STATS = {"made": 0, "reused": 0, "returned": 0, "discarded": 0}
 
 
 @contextlib.contextmanager
@@ -281,9 +300,13 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         elicit_variants: list[str] | None = None,
         elicit_exhaustive: bool = False,
         leak_patterns: list[str] | None = None,
+        engine_reuse: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # Reuse TextWorld engines across rollouts through a per-process pool
+        # (see _TW_ENGINE_POOL). Off by default: one fresh engine per rollout.
+        self.engine_reuse = bool(engine_reuse)
         self.max_context_tokens = max_context_tokens
         self.log_trajectories = log_trajectories  # "none" | "wins" | "all"
         # Action-level ARM (Phase 3): number of reasoning blocks m sampled per
@@ -420,6 +443,77 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         tw_env_id = self._get_tw_env_id(game_file)
         with _logged_parse_lock("make", game_file):
             return textworld.gym.make(tw_env_id)
+
+    def _acquire_tw_env(self, game_file: str):
+        """An engine for ``game_file``; the caller resets it.
+
+        With engine_reuse an idle pooled engine is pointed at this game: its next
+        reset() loads the file into the same engine object and library copy.
+        Otherwise, or when the pool is empty, a fresh engine is made."""
+        if getattr(self, "engine_reuse", False):
+            key = getattr(self, "oracle", "off")
+            with _TW_ENGINE_POOL_LOCK:
+                idle = _TW_ENGINE_POOL.get(key)
+                tw_env = idle.pop() if idle else None
+                if tw_env is not None:
+                    _TW_ENGINE_STATS["reused"] += 1
+                    self._log_engine_pool(key)
+            if tw_env is not None:
+                tw_env._gamefiles_iterator = itertools.repeat(game_file)
+                return tw_env
+        tw_env = self._make_tw_env(game_file)
+        if getattr(self, "engine_reuse", False):
+            with _TW_ENGINE_POOL_LOCK:
+                _TW_ENGINE_STATS["made"] += 1
+                self._log_engine_pool(getattr(self, "oracle", "off"))
+        return tw_env
+
+    def _release_tw_env(self, tw_env) -> None:
+        """Give an engine back at the end of a rollout.
+
+        It returns to the pool only with engine_reuse on and no engine call in
+        flight: a reset or step that raised, or that was abandoned by a timeout
+        and may still be running in its thread, leaves the mark set, and such an
+        engine is closed instead of being handed to another rollout."""
+        if tw_env is None:
+            return
+        reuse = getattr(self, "engine_reuse", False)
+        if reuse and not getattr(tw_env, "_arm_in_call", False):
+            key = getattr(self, "oracle", "off")
+            with _TW_ENGINE_POOL_LOCK:
+                idle = _TW_ENGINE_POOL.setdefault(key, [])
+                if len(idle) < _TW_ENGINE_POOL_MAX_IDLE:
+                    idle.append(tw_env)
+                    _TW_ENGINE_STATS["returned"] += 1
+                    return
+        if reuse:
+            with _TW_ENGINE_POOL_LOCK:
+                _TW_ENGINE_STATS["discarded"] += 1
+        try:
+            tw_env.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _engine_call(tw_env, method: str, *args):
+        """tw_env.<method>(*args), with the engine marked while the call runs.
+
+        The mark is cleared only on a normal return, so an engine whose call
+        raised or never came back is not reused (see _release_tw_env)."""
+        tw_env._arm_in_call = True
+        out = getattr(tw_env, method)(*args)
+        tw_env._arm_in_call = False
+        return out
+
+    @staticmethod
+    def _log_engine_pool(key: str) -> None:
+        """One line every 200 engine requests (call with the pool lock held)."""
+        st = _TW_ENGINE_STATS
+        if (st["made"] + st["reused"]) % 200 == 0:
+            logger.info(
+                f"[engine-pool] made={st['made']} reused={st['reused']} returned={st['returned']} "
+                f"discarded={st['discarded']} idle={len(_TW_ENGINE_POOL.get(key, []))} pid={os.getpid()}"
+            )
 
     @staticmethod
     def _format_obs(obs: str, admissible_commands: list[str]) -> str:
@@ -850,10 +944,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
     async def cleanup_alf_env(self, state: vf.State):
         tw_env = state.pop("alf_env", None)
         if tw_env is not None:
-            try:
-                tw_env.close()
-            except Exception:
-                pass
+            self._release_tw_env(tw_env)
         # Action-level ARM (Phase 3): drop the transient m-block stash so it never
         # serializes into the RolloutOutput (it carries raw Response objects and is
         # consumed same-turn in Phase 4). Overwritten each turn; this is the
@@ -1298,11 +1389,11 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """Make + reset the TextWorld engine for ``game_file`` with the OSError
         retry policy. Returns (tw_env, obs, infos). Shared by the ordinary and the
         seeded setup_state."""
-        tw_env = await asyncio.to_thread(self._make_tw_env, game_file)
+        tw_env = await asyncio.to_thread(self._acquire_tw_env, game_file)
 
         def _reset():
             with _logged_parse_lock("reset", game_file):
-                return tw_env.reset()
+                return self._engine_call(tw_env, "reset")
 
         # Retry on transient OSError. The dominant case is MooseFS chunk-
         # visibility lag during fast_downward's per-call libdownward.so copy:
@@ -1375,7 +1466,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
         def _step(action):
             with _TW_PARSE_LOCK:
-                return tw_env.step([action])
+                return self._engine_call(tw_env, "step", [action])
 
         try:
             for i, action in enumerate(list(seed["actions_prefix"])):
@@ -2185,7 +2276,7 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
 
         def _step():
             with _TW_PARSE_LOCK:
-                return tw_env.step([action])
+                return self._engine_call(tw_env, "step", [action])
 
         # Guard against fast_downward planner hangs: a specific game/state can wedge the
         # planner subprocess inside tw_env.step and (via the shared _TW_PARSE_LOCK) stall
@@ -2491,6 +2582,7 @@ def load_environment(
     elicit_variants: list[str] | None = None,
     elicit_exhaustive: bool = False,
     leak_patterns: list[str] | None = None,
+    engine_reuse: bool = False,
 ) -> vf.Environment:
     """
     Args:
@@ -2524,6 +2616,10 @@ def load_environment(
         tau / n_elicit / elicit_prompt / leak_patterns: synthesize_block's
             acceptance threshold on the normalized row, elicitation attempts,
             instruction template ({action}), and leak regexes (D-4).
+        engine_reuse: keep TextWorld engines in a per-process pool and reset a
+            pooled one onto the next rollout's game instead of making a fresh
+            engine per rollout. Stops the planner-library copies from piling up
+            in node-local /tmp over a long collect. Off by default.
     """
     rubric = vf.Rubric()
     rubric.add_reward_func(alfworld_reward, weight=1.0)
@@ -2567,6 +2663,7 @@ def load_environment(
         elicit_variants=elicit_variants,
         elicit_exhaustive=elicit_exhaustive,
         leak_patterns=leak_patterns,
+        engine_reuse=engine_reuse,
         env_id="alfworld-env",
     )
     return env
