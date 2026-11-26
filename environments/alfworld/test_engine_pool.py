@@ -186,3 +186,28 @@ def test_pool_is_bounded(monkeypatch):
 def test_release_of_nothing_is_a_no_op():
     _env(engine_reuse=True)._release_tw_env(None)
     assert ae._TW_ENGINE_POOL == {}
+
+
+def test_the_pool_line_goes_to_a_logger_the_worker_shows():
+    """An env worker only has handlers for "verifiers.*" loggers (and "verifiers"
+    does not propagate to the root, so the line is read off the logger itself)."""
+    import logging
+
+    seen = []
+
+    class _Keep(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    log = logging.getLogger("verifiers.alfworld.engine_pool")
+    handler, level = _Keep(), log.level
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    try:
+        env = _env(engine_reuse=True)
+        for _ in range(200):
+            _rollout(env, "/g/a.tw-pddl")
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
+    assert len(seen) == 1 and "[engine-pool] made=1 reused=199" in seen[0]

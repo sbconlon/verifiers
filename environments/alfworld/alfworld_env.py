@@ -510,7 +510,8 @@ class ALFWorldEnvironment(vf.MultiTurnEnv):
         """One line every 200 engine requests (call with the pool lock held)."""
         st = _TW_ENGINE_STATS
         if (st["made"] + st["reused"]) % 200 == 0:
-            logger.info(
+            # an env worker only shows "verifiers.*" loggers; this module's own logger has no handler there
+            logging.getLogger("verifiers.alfworld.engine_pool").info(
                 f"[engine-pool] made={st['made']} reused={st['reused']} returned={st['returned']} "
                 f"discarded={st['discarded']} idle={len(_TW_ENGINE_POOL.get(key, []))} pid={os.getpid()}"
             )
